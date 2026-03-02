@@ -31,6 +31,12 @@ class EmbeddingAsyncBackend:
         self.queue = asyncio.Queue()
         asyncio.create_task(self.process_queue())
 
+    def _ensure_int64_inputs(self, inputs):
+        return {
+            k: v.astype(np.int64) if isinstance(v, np.ndarray) and v.dtype != np.int64 else v
+            for k, v in inputs.items()
+        }
+
     @get_time_async
     async def embed_documents_async(self, texts):
         futures = []
@@ -50,6 +56,7 @@ class EmbeddingAsyncBackend:
         inputs_onnx = self._tokenizer(texts, padding=True, truncation=True, max_length=LOCAL_EMBED_MAX_LENGTH,
                                       return_tensors=self.return_tensors)
         inputs_onnx = {k: v for k, v in inputs_onnx.items()}
+        inputs_onnx = self._ensure_int64_inputs(inputs_onnx)
 
         # start_time = time.time()
         outputs_onnx = self.session.run(output_names=['output'], input_feed=inputs_onnx)

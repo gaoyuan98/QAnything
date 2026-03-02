@@ -28,9 +28,16 @@ class EmbeddingOnnxBackend:
         self._session = InferenceSession(LOCAL_EMBED_MODEL_PATH, sess_options=sess_options, providers=providers)
         debug_logger.info(f"EmbeddingClient: model_path: {LOCAL_EMBED_MODEL_PATH}")
 
+    def _ensure_int64_inputs(self, inputs):
+        return {
+            k: v.astype(np.int64) if isinstance(v, np.ndarray) and v.dtype != np.int64 else v
+            for k, v in inputs.items()
+        }
+
     def get_embedding(self, sentences, max_length):
         inputs_onnx = self._tokenizer(sentences, padding=True, truncation=True, max_length=max_length, return_tensors=self.return_tensors)
         inputs_onnx = {k: v for k, v in inputs_onnx.items()}
+        inputs_onnx = self._ensure_int64_inputs(inputs_onnx)
         start_time = time.time()
         outputs_onnx = self._session.run(output_names=['output'], input_feed=inputs_onnx)
         debug_logger.info(f"onnx infer time: {time.time() - start_time}")
@@ -46,6 +53,7 @@ class EmbeddingOnnxBackend:
         try_num = 2
         while outputs_onnx is None and try_num > 0:
             try:
+                inputs = self._ensure_int64_inputs(inputs)
                 io_binding = self._session.io_binding()
                 for k, v in inputs.items():
                     io_binding.bind_cpu_input(k, v)
@@ -58,9 +66,13 @@ class EmbeddingOnnxBackend:
                 outputs_onnx = io_binding.copy_outputs_to_cpu()
                 io_binding.clear_binding_inputs()
                 io_binding.clear_binding_outputs()
-            except:
+            except Exception:
+                debug_logger.exception("onnx inference failed")
                 outputs_onnx = None
             try_num -= 1
+
+        if outputs_onnx is None:
+            raise RuntimeError("onnx inference failed after retries")
 
         return outputs_onnx
 
@@ -109,6 +121,7 @@ class EmbeddingOnnxBackend:
                 tokens_num += (inputs['attention_mask'].sum().item() - 2 * inputs['attention_mask'].shape[0])
 
             inputs = {k: v for k, v in inputs.items()}
+            inputs = self._ensure_int64_inputs(inputs)
 
             start_time_model = time.time()
             outputs_onnx = self.inference(inputs)
