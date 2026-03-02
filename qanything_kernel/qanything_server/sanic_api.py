@@ -1,5 +1,8 @@
 import sys
 import os
+from pathlib import Path
+import mimetypes
+
 # 获取当前脚本的绝对路径
 current_script_path = os.path.abspath(__file__)
 
@@ -43,8 +46,15 @@ Extend(app)
 app.config.REQUEST_MAX_SIZE = 128 * 1024 * 1024
 
 # 将 /qanything 路径映射到 ./dist/qanything 文件夹，并指定路由名称
-app.static('/qanything/', 'qanything_kernel/qanything_server/dist/qanything/', name='qanything', index="index.html")
-
+#app.static('/qanything/', 'qanything_kernel/qanything_server/dist/qanything/', name='qanything', index="index.html")
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("application/wasm", ".wasm")
+mimetypes.add_type("image/svg+xml", ".svg")
+static_dir = Path(
+    r"E:/all_code/python_code/QAnything-qanything-v2/QAnything/qanything_kernel/qanything_server/dist/qanything"
+)
+app.static('/qanything', static_dir, name='qanything', index="index.html")
 
 @app.before_server_start
 async def init_local_doc_qa(app, loop):
