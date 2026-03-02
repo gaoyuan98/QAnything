@@ -5,7 +5,7 @@ from qanything_kernel.configs.model_config import VECTOR_SEARCH_TOP_K, FAISS_LOC
 from typing import Optional, Union, Callable, Dict, Any, List, Tuple
 from langchain_community.vectorstores.faiss import dependable_faiss_import
 from qanything_kernel.utils.custom_log import debug_logger
-from qanything_kernel.connector.database.mysql.mysql_client import KnowledgeBaseManager
+from qanything_kernel.connector.database.db_client import KnowledgeBaseManager
 from qanything_kernel.utils.general_utils import num_tokens
 from functools import lru_cache
 import shutil

@@ -1,5 +1,5 @@
 from qanything_kernel.utils.custom_log import insert_logger
-from qanything_kernel.connector.database.mysql.mysql_client import KnowledgeBaseManager
+from qanything_kernel.connector.database.db_client import KnowledgeBaseManager
 from qanything_kernel.configs.model_config import UPLOAD_ROOT_PATH
 from qanything_kernel.utils.custom_log import debug_logger
 from langchain_core.documents import Document
@@ -77,6 +77,6 @@ class MysqlStore(InMemoryStore):
                 #  json字符串写入本地文件
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 # debug_logger.info(f'write local_path: {local_path}')
-                with open(local_path, 'w') as f:
+                with open(local_path, 'w', encoding='utf-8') as f:
                     f.write(json.dumps(doc_json, ensure_ascii=False))
         return docs

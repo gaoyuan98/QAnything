@@ -15,17 +15,31 @@ from qanything_kernel.utils.custom_log import insert_logger
 from qanything_kernel.utils.general_utils import get_time_async
 from qanything_kernel.core.retriever.general_document import LocalFileForInsert
 from qanything_kernel.core.retriever.vectorstore import VectorStoreMilvusClient
-from qanything_kernel.connector.database.mysql.mysql_client import KnowledgeBaseManager
+from qanything_kernel.connector.database.db_client import KnowledgeBaseManager
 from qanything_kernel.core.retriever.elasticsearchstore import StoreElasticSearchClient
 from qanything_kernel.core.retriever.parent_retriever import ParentRetriever
-from qanything_kernel.configs.model_config import MYSQL_HOST_LOCAL, MYSQL_PORT_LOCAL, \
-    MYSQL_USER_LOCAL, MYSQL_PASSWORD_LOCAL, MYSQL_DATABASE_LOCAL, MAX_CHARS
+from qanything_kernel.configs.model_config import (
+    MYSQL_HOST_LOCAL,
+    MYSQL_PORT_LOCAL,
+    MYSQL_USER_LOCAL,
+    MYSQL_PASSWORD_LOCAL,
+    MYSQL_DATABASE_LOCAL,
+    DAMENG_HOST_LOCAL,
+    DAMENG_PORT_LOCAL,
+    DAMENG_USER_LOCAL,
+    DAMENG_PASSWORD_LOCAL,
+    DAMENG_DATABASE_LOCAL,
+    DB_TYPE,
+    MAX_CHARS,
+)
 from sanic.worker.manager import WorkerManager
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import traceback
 import time
 import random
 import aiomysql
+from dbutils.pooled_db import PooledDB
 import argparse
 import json
 
@@ -51,6 +65,53 @@ db_config = {
     'password': MYSQL_PASSWORD_LOCAL,
     'db': MYSQL_DATABASE_LOCAL,
 }
+
+
+def _is_dameng():
+    return str(DB_TYPE).lower() in ("dameng", "dm")
+
+
+def _dm_execute_sync(pool, query, params=(), fetchone=False, fetchall=False, commit=False):
+    conn = pool.connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        query = query.replace("%s", "?")
+        cursor.execute(query, params or ())
+        if commit:
+            conn.commit()
+        if fetchone:
+            return cursor.fetchone()
+        if fetchall:
+            return cursor.fetchall()
+        return None
+    except Exception:
+        if commit:
+            conn.rollback()
+        raise
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if not commit:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        conn.close()
+
+
+async def dm_execute(pool, executor, query, params=(), fetchone=False, fetchall=False, commit=False):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        executor,
+        _dm_execute_sync,
+        pool,
+        query,
+        params,
+        fetchone,
+        fetchall,
+        commit,
+    )
 
 
 @get_time_async
@@ -136,7 +197,91 @@ async def process_data(retriever, milvus_kb, mysql_client, file_info, time_recor
     return status, content_length, chunks_number, msg
 
 
-async def check_and_process(pool):
+
+async def check_and_process_dm(pool, dm_executor):
+    process_type = 'MainProcess' if 'SANIC_WORKER_NAME' not in os.environ else os.environ['SANIC_WORKER_NAME']
+    worker_id = int(process_type.split('-')[-2])
+    insert_logger.info(f"{os.getpid()} worker_id is {worker_id}")
+    mysql_client = KnowledgeBaseManager()
+    milvus_kb = VectorStoreMilvusClient()
+    es_client = StoreElasticSearchClient()
+    retriever = ParentRetriever(milvus_kb, mysql_client, es_client)
+    while True:
+        sleep_time = 3
+        minutes = int(int(time.strftime("%M", time.localtime())) / INSERT_WORKERS)
+        dynamic_worker_id = (worker_id + minutes) % INSERT_WORKERS
+        id = None
+        try:
+            query = '''
+                SELECT id, timestamp, file_id, file_name FROM File
+                WHERE status = 'gray' AND MOD(id, ?) = ? AND deleted = 0
+                ORDER BY timestamp ASC FETCH FIRST 1 ROWS ONLY
+            '''
+            file_to_update = await dm_execute(pool, dm_executor, query, (INSERT_WORKERS, dynamic_worker_id), fetchone=True)
+
+            if file_to_update:
+                insert_logger.info(f"{worker_id}, file_to_update: {file_to_update}")
+                id, timestamp, file_id, file_name = file_to_update
+                await dm_execute(
+                    pool, dm_executor,
+                    "UPDATE File SET status='yellow' WHERE id=?",
+                    (id,),
+                    commit=True,
+                )
+                insert_logger.info(f"UPDATE FILE: {timestamp}, {file_id}, {file_name}, yellow")
+
+                file_info = await dm_execute(
+                    pool, dm_executor,
+                    "SELECT id, file_id, user_id, file_name, kb_id, file_location, file_size, file_url, chunk_size FROM File WHERE id=?",
+                    (id,),
+                    fetchone=True,
+                )
+
+                time_record = {}
+                status, content_length, chunks_number, msg = await process_data(
+                    retriever,
+                    milvus_kb,
+                    mysql_client,
+                    file_info,
+                    time_record,
+                )
+
+                insert_logger.info('time_record: ' + json.dumps(time_record, ensure_ascii=False))
+                await dm_execute(
+                    pool, dm_executor,
+                    "UPDATE File SET status=?, content_length=?, chunks_number=?, msg=? WHERE id=?",
+                    (status, content_length, chunks_number, msg, file_info[0]),
+                    commit=True,
+                )
+                insert_logger.info(f"UPDATE FILE: {timestamp}, {file_id}, {file_name}, {status}")
+                sleep_time = 0.1
+        except Exception as e:
+            insert_logger.error('MySQL或Milvus 连接异常： ' + str(e))
+            try:
+                insert_logger.error(f"process_files Error {traceback.format_exc()}")
+                if id is not None:
+                    await dm_execute(
+                        pool, dm_executor,
+                        "UPDATE File SET status='red' WHERE id=? AND status='yellow'",
+                        (id,),
+                        commit=True,
+                    )
+                    file_info = await dm_execute(
+                        pool, dm_executor,
+                        "SELECT id, file_id, user_id, file_name, kb_id, file_location, file_size FROM File WHERE id=?",
+                        (id,),
+                        fetchone=True,
+                    )
+                    insert_logger.info(f"UPDATE FILE: {timestamp}, {file_id}, {file_name}, yellow2red")
+            except Exception as inner_e:
+                insert_logger.error('Dameng 二次连接异常：' + str(inner_e))
+        finally:
+            await asyncio.sleep(sleep_time)
+
+
+async def check_and_process(pool, dm_executor=None):
+    if _is_dameng():
+        return await check_and_process_dm(pool, dm_executor)
     process_type = 'MainProcess' if 'SANIC_WORKER_NAME' not in os.environ else os.environ['SANIC_WORKER_NAME']
     worker_id = int(process_type.split('-')[-2])
     insert_logger.info(f"{os.getpid()} worker_id is {worker_id}")
@@ -225,7 +370,15 @@ async def check_and_process(pool):
 
 @app.listener('after_server_stop')
 async def close_db(app, loop):
-    # 关闭数据库连接池
+    # Close database connection pool
+    if _is_dameng():
+        close_pool = getattr(app.ctx.pool, "close", None)
+        if callable(close_pool):
+            close_pool()
+        executor = getattr(app.ctx, "dm_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+        return
     app.ctx.pool.close()
     await app.ctx.pool.wait_closed()
 
@@ -233,8 +386,30 @@ async def close_db(app, loop):
 @app.listener('before_server_start')
 async def setup_workers(app, loop):
     # 创建数据库连接池
+    if _is_dameng():
+        try:
+            import dmPython
+        except ImportError as exc:
+            raise RuntimeError("dmPython is required when DB_TYPE is dameng") from exc
+        app.ctx.pool = PooledDB(
+            creator=dmPython,
+            maxconnections=12,
+            mincached=12,
+            maxcached=12,
+            maxshared=0,
+            blocking=True,
+            ping=1,
+            user=DAMENG_USER_LOCAL,
+            password=DAMENG_PASSWORD_LOCAL,
+            server=DAMENG_HOST_LOCAL,
+            port=DAMENG_PORT_LOCAL,
+            schema=DAMENG_DATABASE_LOCAL,
+        )
+        app.ctx.dm_executor = ThreadPoolExecutor(max_workers=12)
+        app.add_task(check_and_process(app.ctx.pool, app.ctx.dm_executor))
+        return
     app.ctx.pool = await aiomysql.create_pool(**db_config, minsize=1, maxsize=16, loop=loop, autocommit=False,
-                                              init_command='SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED')  # 更改事务隔离级别
+                                              init_command='SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED')
     app.add_task(check_and_process(app.ctx.pool))
 
 

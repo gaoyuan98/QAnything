@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 # 获取环境变量GATEWAY_IP
-GATEWAY_IP = os.getenv("GATEWAY_IP", "localhost")
+GATEWAY_IP = "192.168.112.179"
 # LOG_FORMAT = "%(levelname) -5s %(asctime)s" "-1d: %(message)s"
 # logger = logging.getLogger()
 # logger.setLevel(logging.INFO)
@@ -167,11 +167,11 @@ KB_SUFFIX = '_240625'
 # MILVUS_HOST_LOCAL = 'milvus-standalone-local'
 # MILVUS_PORT = 19530
 MILVUS_HOST_LOCAL = GATEWAY_IP
-MILVUS_PORT = 19540
+MILVUS_PORT = 19530
 MILVUS_COLLECTION_NAME = 'qanything_collection' + KB_SUFFIX
 
 # ES_URL = 'http://es-container-local:9200/'
-ES_URL = f'http://{GATEWAY_IP}:9210/'
+ES_URL = f'http://{GATEWAY_IP}:9200/'
 ES_USER = None
 ES_PASSWORD = None
 ES_TOP_K = 30
@@ -179,11 +179,19 @@ ES_INDEX_NAME = 'qanything_es_index' + KB_SUFFIX
 
 # MYSQL_HOST_LOCAL = 'mysql-container-local'
 # MYSQL_PORT_LOCAL = 3306
+#("dameng", "dm")
+DB_TYPE = "dm"
 MYSQL_HOST_LOCAL = GATEWAY_IP
 MYSQL_PORT_LOCAL = 3316
 MYSQL_USER_LOCAL = 'root'
 MYSQL_PASSWORD_LOCAL = '123456'
 MYSQL_DATABASE_LOCAL = 'qanything'
+
+DAMENG_HOST_LOCAL = GATEWAY_IP
+DAMENG_PORT_LOCAL = 5236
+DAMENG_USER_LOCAL = "TEST2026"
+DAMENG_PASSWORD_LOCAL = "Dameng123"
+DAMENG_DATABASE_LOCAL = "TEST2026"
 
 LOCAL_OCR_SERVICE_URL = "localhost:7001"
 
@@ -194,7 +202,7 @@ LOCAL_RERANK_MODEL_NAME = 'rerank'
 LOCAL_RERANK_MAX_LENGTH = 512
 LOCAL_RERANK_BATCH = 1
 LOCAL_RERANK_THREADS = 1
-LOCAL_RERANK_PATH = os.path.join(root_path, 'qanything_kernel/dependent_server/rerank_server', 'rerank_model_configs_v0.0.1')
+LOCAL_RERANK_PATH = os.path.join(root_path, 'qanything_kernel/dependent_server/rerank_server', 'bce-reranker-base_v1')
 LOCAL_RERANK_MODEL_PATH = os.path.join(LOCAL_RERANK_PATH, "rerank.onnx")
 
 LOCAL_EMBED_SERVICE_URL = "localhost:9001"
@@ -202,7 +210,7 @@ LOCAL_EMBED_MODEL_NAME = 'embed'
 LOCAL_EMBED_MAX_LENGTH = 512
 LOCAL_EMBED_BATCH = 1
 LOCAL_EMBED_THREADS = 1
-LOCAL_EMBED_PATH = os.path.join(root_path, 'qanything_kernel/dependent_server/embedding_server', 'embedding_model_configs_v0.0.1')
+LOCAL_EMBED_PATH = os.path.join(root_path, 'qanything_kernel/dependent_server/embedding_server', 'bce-embedding-base_v1')
 LOCAL_EMBED_MODEL_PATH = os.path.join(LOCAL_EMBED_PATH, "embed.onnx")
 
 TOKENIZER_PATH = os.path.join(root_path, 'qanything_kernel/connector/llm/tokenizer_files')

@@ -12,7 +12,7 @@ from qanything_kernel.connector.llm import OpenAILLM
 from langchain.schema import Document
 from langchain.schema.messages import AIMessage, HumanMessage
 from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
-from qanything_kernel.connector.database.mysql.mysql_client import KnowledgeBaseManager
+from qanything_kernel.connector.database.db_client import KnowledgeBaseManager
 from qanything_kernel.core.retriever.vectorstore import VectorStoreMilvusClient
 from qanything_kernel.core.retriever.elasticsearchstore import StoreElasticSearchClient
 from qanything_kernel.core.retriever.parent_retriever import ParentRetriever

@@ -27,3 +27,5 @@ front_end/components.d.ts
 front_end/stats.html
 front_end/version.txt
 tmp_files/
+/qanything_kernel/dependent_server/rerank_server/bce-reranker-base_v1/
+/qanything_kernel/dependent_server/embedding_server/bce-embedding-base_v1/

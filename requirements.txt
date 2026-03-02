@@ -10,6 +10,8 @@ unstructured[md]==0.12.4
 opencv-python-headless==4.9.0.80
 python-dotenv==1.0.1
 mysql-connector-python==8.2.0
+dmPython
+DBUtils==3.1.1
 pymilvus==2.3.6
 langchain-openai==0.0.8
 aiomysql==0.2.0
@@ -58,4 +60,4 @@ hanziconv==0.3.2
 PyPDF2==3.0.1
 lxml_html_clean==0.1.1
 docx2txt==0.8
-ipython==8.26.0
+ipython==8.18.1
