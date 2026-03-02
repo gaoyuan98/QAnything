@@ -12,15 +12,9 @@ import json
 import uuid
 from datetime import datetime, timedelta
 import re
-import threading
 
 
 class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
-    _pool = None
-    _pool_lock = threading.Lock()
-    _pool_size = None
-    _pool_free = 0
-    _pool_used = 0
 
     def __init__(self, pool_size=12):
         self.pool_size = pool_size
@@ -63,35 +57,22 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
             import dmPython
         except ImportError as exc:
             raise RuntimeError("dmPython is required when DB_TYPE is dameng") from exc
-        with KnowledgeBaseManager._pool_lock:
-            if KnowledgeBaseManager._pool is None:
-                KnowledgeBaseManager._pool = PooledDB(
-                    creator=dmPython,
-                    maxconnections=self.pool_size,
-                    mincached=self.pool_size,
-                    maxcached=self.pool_size,
-                    maxshared=0,
-                    blocking=True,
-                    ping=1,
-                    user=self.dm_config["user"],
-                    password=self.dm_config["password"],
-                    server=self.dm_config["host"],
-                    port=self.dm_config["port"],
-                    schema=self.dm_config.get("database"),
-                )
-                KnowledgeBaseManager._pool_size = self.pool_size
-                KnowledgeBaseManager._pool_free = self.pool_size
-                KnowledgeBaseManager._pool_used = 0
-            elif KnowledgeBaseManager._pool_size != self.pool_size:
-                debug_logger.info(
-                    "Reuse existing Dameng pool size {} (requested {}).".format(
-                        KnowledgeBaseManager._pool_size, self.pool_size
-                    )
-                )
-        self.cnxpool = KnowledgeBaseManager._pool
-        self.pool_size = KnowledgeBaseManager._pool_size
-        self.free_cnx = KnowledgeBaseManager._pool_free
-        self.used_cnx = KnowledgeBaseManager._pool_used
+        self.cnxpool = PooledDB(
+            creator=dmPython,
+            maxconnections=self.pool_size,
+            mincached=self.pool_size,
+            maxcached=self.pool_size,
+            maxshared=0,
+            blocking=True,
+            ping=1,
+            user=self.dm_config["user"],
+            password=self.dm_config["password"],
+            server=self.dm_config["host"],
+            port=self.dm_config["port"],
+            schema=self.dm_config.get("database"),
+        )
+        self.free_cnx = self.pool_size
+        self.used_cnx = 0
 
     def _dm_connect(self):
         try:
@@ -107,31 +88,21 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
 
     def _dm_get_connection(self):
         conn = self.cnxpool.connection()
-        with KnowledgeBaseManager._pool_lock:
-            KnowledgeBaseManager._pool_used += 1
-            KnowledgeBaseManager._pool_free -= 1
-            self.used_cnx = KnowledgeBaseManager._pool_used
-            self.free_cnx = KnowledgeBaseManager._pool_free
-            if KnowledgeBaseManager._pool_free < 4:
-                debug_logger.info(
-                    "Get connection success. Pool status: free {} used {}".format(
-                        KnowledgeBaseManager._pool_free, KnowledgeBaseManager._pool_used
-                    )
-                )
+        self.used_cnx += 1
+        self.free_cnx -= 1
+        if self.free_cnx < 4:
+            debug_logger.info(
+                "Get connection success. Pool status: free {} used {}".format(self.free_cnx, self.used_cnx)
+            )
         return conn
 
     def _dm_release_connection(self, conn):
-        with KnowledgeBaseManager._pool_lock:
-            KnowledgeBaseManager._pool_used -= 1
-            KnowledgeBaseManager._pool_free += 1
-            self.used_cnx = KnowledgeBaseManager._pool_used
-            self.free_cnx = KnowledgeBaseManager._pool_free
-            if KnowledgeBaseManager._pool_free <= 4:
-                debug_logger.info(
-                    "Release connection. Pool status: free {} used {}".format(
-                        KnowledgeBaseManager._pool_free, KnowledgeBaseManager._pool_used
-                    )
-                )
+        self.used_cnx -= 1
+        self.free_cnx += 1
+        if self.free_cnx <= 4:
+            debug_logger.info(
+                "Release connection. Pool status: free {} used {}".format(self.free_cnx, self.used_cnx)
+            )
         conn.close()
 
     def _is_ddl_query(self, query):
@@ -196,6 +167,25 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
                         pass
                 self._dm_release_connection(conn)
         return result
+
+    def delete_documents(self, file_ids):
+        total_deleted = 0
+        for file_id in file_ids:
+            query = "SELECT doc_id FROM Documents WHERE doc_id LIKE %s"
+            doc_ids = self.execute_query_(query, (f"{file_id}_%",), fetch=True)
+            debug_logger.info(f"Found documents to delete: {doc_ids}, {file_id}")
+
+            if doc_ids:
+                doc_ids = [doc_id[0] for doc_id in doc_ids]
+                batch_size = 100
+                for i in range(0, len(doc_ids), batch_size):
+                    batch_doc_ids = doc_ids[i:i + batch_size]
+                    placeholders = ','.join(['%s'] * len(batch_doc_ids))
+                    delete_query = "DELETE FROM Documents WHERE doc_id IN ({})".format(placeholders)
+                    res = self.execute_query_(delete_query, batch_doc_ids, commit=True, check=True)
+                    total_deleted += res
+        debug_logger.info(f"Deleted documents count: {total_deleted}")
+
 
     def create_tables_(self):
         user_table = self._user_table()
