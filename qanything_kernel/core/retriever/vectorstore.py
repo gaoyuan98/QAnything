@@ -1,301 +1,538 @@
+import ast
+import asyncio
+import json
+import re
+import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Optional, List, Any, Iterable, Callable
-from qanything_kernel.utils.custom_log import debug_logger, insert_logger
-from qanything_kernel.configs.model_config import MILVUS_PORT, MILVUS_COLLECTION_NAME, MILVUS_HOST_LOCAL
+from typing import Any, Iterable, List, Optional
+
+from dmSQLAlchemy import CollectionSchema, DataType, FieldSchema, dmVecClient
+from langchain_core.documents import Document
+from langchain_core.vectorstores import VectorStore
+
+from qanything_kernel.configs.model_config import (
+    DAMENG_DATABASE_LOCAL,
+    DAMENG_HOST_LOCAL,
+    DAMENG_PASSWORD_LOCAL,
+    DAMENG_PORT_LOCAL,
+    DAMENG_USER_LOCAL,
+    MILVUS_COLLECTION_NAME,
+)
 from qanything_kernel.connector.embedding.embedding_for_online_client import YouDaoEmbeddings
-from qanything_kernel.utils.general_utils import get_time, get_time_async
-from langchain_community.vectorstores.milvus import Milvus
-from pymilvus.orm.collection import MutationResult
-import asyncio
-import time
+from qanything_kernel.utils.custom_log import debug_logger, insert_logger
+from qanything_kernel.utils.general_utils import get_time
 
 
-class SelfMilvus(Milvus):
+class SelfDMVectorStore(VectorStore):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.last_flush_time = 0  # 初始化为0，确保首次调用_should_flush时返回True
+        self.embedding_func = kwargs.get("embedding_function")
+        if self.embedding_func is None:
+            raise ValueError("embedding_function is required")
+
+        connection_args = kwargs.get("connection_args") or {}
+        host = connection_args.get("host", DAMENG_HOST_LOCAL)
+        port = connection_args.get("port", DAMENG_PORT_LOCAL)
+
+        self._dm_uri = connection_args.get("uri", f"{host}:{port}")
+        self._dm_user = connection_args.get("user", DAMENG_USER_LOCAL)
+        self._dm_password = connection_args.get("password", DAMENG_PASSWORD_LOCAL)
+        self._dm_db_name = connection_args.get("db_name", DAMENG_DATABASE_LOCAL)
+        self.timeout = kwargs.get("timeout", 10)
+
+        self.collection_name = kwargs.get("collection_name", MILVUS_COLLECTION_NAME)
+        self.metric_type = (
+            (kwargs.get("search_params") or {}).get("metric_type")
+            or kwargs.get("metric_type")
+            or "COSINE"
+        ).upper()
+
+        self.auto_id = kwargs.get("auto_id", True)
+
+        self._primary_field = kwargs.get("primary_field", "id")
+        self._text_field = kwargs.get("text_field", "text")
+        self._vector_field = kwargs.get("vector_field", "vector")
+        self._doc_id_field = "doc_id"
+        self._kb_id_field = "kb_id"
+        self._file_id_field = "file_id"
+        self._metadata_field = "metadata_json"
+
+        self.last_flush_time = 0.0
         self.inserted_since_last_flush = 0
-        self.flush_interval = 600  # 600 seconds
-        self.flush_threshold = 10000  # 10,000 entities
+        self.flush_interval = 600
+        self.flush_threshold = 10000
+
+        self._vector_dim: Optional[int] = None
+        self._collection_ready = False
+        self._create_lock = threading.Lock()
+        self._client_local = threading.local()
+
+    @property
+    def embeddings(self):
+        return self.embedding_func
+
+    def _run_coro_sync(self, coro):
+        try:
+            asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(asyncio.run, coro).result()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+    def _get_client(self) -> dmVecClient:
+        client = getattr(self._client_local, "client", None)
+        if client is None:
+            client = dmVecClient(
+                uri=self._dm_uri,
+                user=self._dm_user,
+                password=self._dm_password,
+                db_name=self._dm_db_name,
+                timeout=self.timeout,
+            )
+            self._client_local.client = client
+        return client
+
+    def _check_collection_exists(self) -> bool:
+        client = self._get_client()
+        exists = client.has_collection(self.collection_name)
+        if exists:
+            self._collection_ready = True
+        return exists
+
+    def _ensure_collection(self, vector_dim: Optional[int] = None) -> None:
+        if self._collection_ready:
+            return
+
+        with self._create_lock:
+            if self._collection_ready:
+                return
+
+            client = self._get_client()
+            if client.has_collection(self.collection_name):
+                self._collection_ready = True
+                return
+
+            if vector_dim is None:
+                raise ValueError("Vector dimension is required when creating a new DM collection.")
+
+            fields = [
+                FieldSchema(self._primary_field, DataType.VARCHAR, is_primary=True, auto_id=False),
+                FieldSchema(self._doc_id_field, DataType.VARCHAR),
+                FieldSchema(self._kb_id_field, DataType.VARCHAR),
+                FieldSchema(self._file_id_field, DataType.VARCHAR),
+                FieldSchema(self._text_field, DataType.TEXT),
+                FieldSchema(self._metadata_field, DataType.TEXT),
+                FieldSchema(self._vector_field, DataType.FLOAT_VECTOR, dim=vector_dim),
+            ]
+            schema = CollectionSchema(fields=fields, description="QAnything DM vector collection")
+            index_params = client.prepare_index_params()
+            index_name = f"{self.collection_name}_{self._vector_field}_hnsw_idx"
+            index_params.add_index(
+                field_name=self._vector_field,
+                index_type="HNSW",
+                index_name=index_name,
+                metric_name=self.metric_type,
+            )
+            client.create_collection(
+                collection_name=self.collection_name,
+                schema=schema,
+                metric_type=self.metric_type,
+                index_params=index_params,
+            )
+            client.commit()
+            self._collection_ready = True
+            self._vector_dim = vector_dim
+            debug_logger.info(
+                f"created DM vector collection: {self.collection_name}, dim={vector_dim}, metric={self.metric_type}"
+            )
+
+    def _load_table(self):
+        try:
+            return self._get_client().load_table(self.collection_name)
+        except Exception:
+            return None
+
+    def _parse_literal(self, value: str) -> Any:
+        text = value.strip()
+        if not text:
+            return text
+
+        try:
+            return ast.literal_eval(text)
+        except Exception:
+            pass
+
+        low = text.lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+        return text
+
+    def _build_filter(self, expr: Optional[str], table) -> Optional[List[Any]]:
+        if not expr or not expr.strip():
+            return None
+
+        clauses = []
+        conds = re.split(r"\s+and\s+", expr.strip(), flags=re.IGNORECASE)
+
+        for cond in conds:
+            cond = cond.strip()
+            if not cond:
+                continue
+
+            in_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+)$", cond, flags=re.IGNORECASE)
+            eq_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*==\s*(.+)$", cond)
+
+            if in_match:
+                field = in_match.group(1)
+                raw_value = in_match.group(2)
+                if field not in table.c:
+                    raise ValueError(f"Unsupported filter field: {field}")
+                parsed = self._parse_literal(raw_value)
+                if isinstance(parsed, (list, tuple, set)):
+                    values = list(parsed)
+                else:
+                    values = [parsed]
+                clauses.append(table.c[field].in_(values))
+                continue
+
+            if eq_match:
+                field = eq_match.group(1)
+                raw_value = eq_match.group(2)
+                if field not in table.c:
+                    raise ValueError(f"Unsupported filter field: {field}")
+                clauses.append(table.c[field] == self._parse_literal(raw_value))
+                continue
+
+            raise ValueError(f"Unsupported expression condition: {cond}")
+
+        return clauses or None
+
+    def _normalize_vector(self, vector: List[float]) -> List[float]:
+        return [float(v) for v in vector]
+
+    def _row_to_document(self, row: dict) -> Document:
+        metadata = {}
+        raw_metadata = row.get(self._metadata_field)
+        if isinstance(raw_metadata, dict):
+            metadata.update(raw_metadata)
+        elif isinstance(raw_metadata, str) and raw_metadata:
+            try:
+                metadata.update(json.loads(raw_metadata))
+            except Exception:
+                metadata = {}
+
+        for field in (self._doc_id_field, self._kb_id_field, self._file_id_field):
+            value = row.get(field)
+            if value is not None and field not in metadata:
+                metadata[field] = value
+
+        content = row.get(self._text_field) or ""
+        return Document(page_content=content, metadata=metadata)
 
     def _should_flush(self) -> bool:
-        current_time = time.time()
-        time_since_last_flush = current_time - self.last_flush_time
-        return (self.inserted_since_last_flush >= self.flush_threshold or
-                time_since_last_flush >= self.flush_interval or self.last_flush_time == 0)
+        return False
 
     @get_time
     def _milvus_flush(self):
-        asyncio.create_task(asyncio.to_thread(self.col.flush))
         self.last_flush_time = time.time()
         self.inserted_since_last_flush = 0
-        insert_logger.info(f"Flushed Milvus collection at {self.last_flush_time}")
+        insert_logger.info(f"DM vectorstore flush noop at {self.last_flush_time}")
 
-    def _create_collection(
-            self, embeddings: list, metadatas: Optional[list[dict]] = None
-    ) -> None:
-        from pymilvus import (
-            Collection,
-            CollectionSchema,
-            DataType,
-            FieldSchema,
-            MilvusException,
-        )
-        from pymilvus.orm.types import infer_dtype_bydata
-
-        # Determine embedding dim
-        dim = len(embeddings[0])
-        fields = []
-        if self._metadata_field is not None:
-            fields.append(FieldSchema(self._metadata_field, DataType.JSON))
-        else:
-            # Determine metadata schema
-            if metadatas:
-                # Create FieldSchema for each entry in metadata.
-                for key, value in metadatas[0].items():
-                    print(key, value, flush=True)
-                    # Infer the corresponding datatype of the metadata
-                    dtype = infer_dtype_bydata(value)
-                    # Datatype isn't compatible
-                    if dtype == DataType.UNKNOWN or dtype == DataType.NONE:
-                        debug_logger.error(
-                            (
-                                "Failure to create collection, "
-                                "unrecognized dtype for key: %s"
-                            ),
-                            key,
-                        )
-                        raise ValueError(f"Unrecognized datatype for {key}.")
-                    # Dataype is a string/varchar equivalent
-                    elif dtype == DataType.VARCHAR:
-                        fields.append(
-                            FieldSchema(key, DataType.VARCHAR, max_length=65_535)
-                        )
-                    else:
-                        fields.append(FieldSchema(key, dtype))
-
-        # Create the text field
-        fields.append(
-            FieldSchema(self._text_field, DataType.VARCHAR, max_length=65_535)
-        )
-        # Create the primary key field
-        if self.auto_id:
-            fields.append(
-                FieldSchema(
-                    self._primary_field, DataType.INT64, is_primary=True, auto_id=True
-                )
-            )
-        else:
-            fields.append(
-                FieldSchema(
-                    self._primary_field,
-                    DataType.VARCHAR,
-                    is_primary=True,
-                    auto_id=False,
-                    max_length=65_535,
-                )
-            )
-        # Create the vector field, supports binary or float vectors
-        fields.append(
-            FieldSchema(self._vector_field, infer_dtype_bydata(embeddings[0]), dim=dim)
-        )
-
-        # Create the schema for the collection
-        schema = CollectionSchema(
-            fields,
-            description=self.collection_description,
-            partition_key_field=self._partition_key_field,
-        )
-
-        # Create the collection
-        try:
-            self.col = Collection(
-                name=self.collection_name,
-                schema=schema,
-                consistency_level=self.consistency_level,
-                using=self.alias,
-                num_partitions=64
-            )
-            # Set the collection properties if they exist
-            if self.collection_properties is not None:
-                self.col.set_properties(self.collection_properties)
-        except MilvusException as e:
-            debug_logger.error(
-                "Failed to create collection: %s error: %s", self.collection_name, e
-            )
-            raise e
-
-    def get_expr_result(self, expr: str, output_fields: List[str]) -> List[int] | None:
-        """Get query result with expression
-
-        Args:
-            expr: Expression - E.g: "id in [1, 2]", or "title LIKE 'Abc%'"
-            output_fields: List of fields to return
-
-        Returns:
-            List[int]: List of IDs (Primary Keys)
-        """
-
-        from pymilvus import MilvusException
-
-        if self.col is None:
-            debug_logger.debug("No existing collection to get pk.")
+    def get_expr_result(self, expr: str, output_fields: List[str]) -> List[dict] | None:
+        if not self._check_collection_exists():
+            debug_logger.debug("No existing collection to query.")
             return None
 
-        try:
-            query_result = self.col.query(
-                expr=expr, output_fields=output_fields
-            )
-        except MilvusException as exc:
-            debug_logger.error("Failed to get ids: %s error: %s", self.collection_name, exc)
-            raise exc
-        return query_result
+        table = self._load_table()
+        if table is None:
+            return None
+
+        filters = self._build_filter(expr, table)
+        return self._get_client().query(
+            collection_name=self.collection_name,
+            filter=filters,
+            output_fields=output_fields,
+            timeout=self.timeout,
+        )
 
     async def aadd_texts(
-            self,
-            texts: Iterable[str],
-            metadatas: Optional[List[dict]] = None,
-            timeout: Optional[int] = None,
-            batch_size: int = 1000,
-            *,
-            ids: Optional[List[str]] = None,
-            **kwargs: Any,
+        self,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        timeout: Optional[int] = None,
+        batch_size: int = 1000,
+        *,
+        ids: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> List[str]:
-        """Asynchronously run texts through embeddings and add to the vectorstore."""
-        # 从kwargs中获取time_record
-        time_record = kwargs.get('time_record', {})
-
-        from pymilvus import Collection, MilvusException
-
+        time_record = kwargs.get("time_record", {})
         texts = list(texts)
+
+        if not texts:
+            insert_logger.info("Nothing to insert, skipping.")
+            return []
+
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
+        if len(metadatas) != len(texts):
+            raise ValueError("metadatas length must be equal to texts length")
+
         if not self.auto_id:
             assert isinstance(ids, list), "A list of valid ids are required when auto_id is False."
             assert len(set(ids)) == len(texts), "Different lengths of texts and unique ids are provided."
-            assert all(len(x.encode()) <= 65_535 for x in ids), "Each id should be a string less than 65535 bytes."
+        elif ids is not None and len(ids) != len(texts):
+            raise ValueError("ids length must be equal to texts length")
 
-        # Assuming self.embedding_func has an async method embed_documents_async
         embedding_start = time.perf_counter()
         try:
             embeddings = await self.embedding_func.aembed_documents(texts)
         except NotImplementedError:
             embeddings = [await self.embedding_func.aembed_query(x) for x in texts]
-        time_record['milvus_embedding_time'] = round(time.perf_counter() - embedding_start, 2)
+        time_record["milvus_embedding_time"] = round(time.perf_counter() - embedding_start, 2)
 
-        if len(embeddings) == 0:
-            insert_logger.info("Nothing to insert, skipping.")
+        if not embeddings:
+            insert_logger.info("No embeddings generated, skipping.")
             return []
 
-        # If the collection hasn't been initialized yet, perform all steps to do so
-        if not isinstance(self.col, Collection):
-            kwargs = {"embeddings": embeddings, "metadatas": metadatas}
-            if self.partition_names:
-                kwargs["partition_names"] = self.partition_names
-            if self.replica_number:
-                kwargs["replica_number"] = self.replica_number
-            if self.timeout:
-                kwargs["timeout"] = self.timeout
-            self._init(**kwargs)
+        self._ensure_collection(vector_dim=len(embeddings[0]))
 
-        # Dict to hold all insert columns
-        insert_dict: dict[str, list] = {
-            self._text_field: texts,
-            self._vector_field: embeddings,
-        }
+        row_ids = []
+        rows = []
+        for idx, (text, metadata, embedding) in enumerate(zip(texts, metadatas, embeddings)):
+            row_id = ids[idx] if ids else uuid.uuid4().hex
+            row_ids.append(row_id)
+            metadata = dict(metadata or {})
 
-        if not self.auto_id:
-            insert_dict[self._primary_field] = ids
-
-        if self._metadata_field is not None:
-            for d in metadatas or []:
-                insert_dict.setdefault(self._metadata_field, []).append(d)
-        else:
-            # Collect the metadata into the insert dict.
-            if metadatas is not None:
-                for d in metadatas:
-                    for key, value in d.items():
-                        keys = (
-                            [x for x in self.fields if x != self._primary_field]
-                            if self.auto_id
-                            else [x for x in self.fields]
-                        )
-                        if key in keys:
-                            insert_dict.setdefault(key, []).append(value)
-
-        # Total insert count
-        vectors: list = insert_dict[self._vector_field]
-        total_count = len(vectors)
-
-        pks: list[str] = []
+            rows.append(
+                {
+                    self._primary_field: row_id,
+                    self._doc_id_field: str(metadata.get(self._doc_id_field, "")),
+                    self._kb_id_field: str(metadata.get(self._kb_id_field, "")),
+                    self._file_id_field: str(metadata.get(self._file_id_field, "")),
+                    self._text_field: text,
+                    self._metadata_field: json.dumps(metadata, ensure_ascii=False, default=str),
+                    self._vector_field: self._normalize_vector(embedding),
+                }
+            )
 
         insert_start = time.perf_counter()
-        assert isinstance(self.col, Collection)
-        for i in range(0, total_count, batch_size):
-            # Grab end index
-            end = min(i + batch_size, total_count)
-            # Convert dict to list of lists batch for insertion
-            insert_list = [
-                insert_dict[x][i:end] for x in self.fields if x in insert_dict
-            ]
-            # Insert into the collection.
-            try:
-                res: MutationResult = await asyncio.to_thread(
-                    self.col.insert, insert_list, timeout=timeout, **kwargs
-                )
-                # insert_logger.info(f"insert: {res}, insert keys: {res.primary_keys}")
-                insert_logger.info(f"insert: {res}")
-                pks.extend(res.primary_keys)
-            except MilvusException as e:
-                insert_logger.error(
-                    "Failed to insert batch starting at entity: %s/%s", i, total_count
-                )
-                raise e
-            self.inserted_since_last_flush += end - i
+        client = self._get_client()
+        for start in range(0, len(rows), batch_size):
+            end = min(start + batch_size, len(rows))
+            client.insert(
+                collection_name=self.collection_name,
+                data=rows[start:end],
+                timeout=timeout if timeout is not None else self.timeout,
+            )
+            self.inserted_since_last_flush += end - start
+        client.commit()
 
-        time_record['milvus_insert_time'] = round(time.perf_counter() - insert_start, 2)
+        time_record["milvus_insert_time"] = round(time.perf_counter() - insert_start, 2)
+        return row_ids
 
-        asyncio.create_task(asyncio.to_thread(self.col.flush))
-        # if self._should_flush():
-        #     self._milvus_flush()
+    def add_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        **kwargs: Any,
+    ) -> List[str]:
+        return self._run_coro_sync(self.aadd_texts(texts=texts, metadatas=metadatas, **kwargs))
 
-        # self.col.flush()
-        return pks
+    async def aadd_documents(self, documents: List[Document], **kwargs: Any) -> List[str]:
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        return await self.aadd_texts(texts=texts, metadatas=metadatas, **kwargs)
+
+    async def asimilarity_search_with_score(
+        self,
+        query: str,
+        k: int = 4,
+        expr: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[tuple[Document, float]]:
+        if not self._check_collection_exists():
+            return []
+
+        table = self._load_table()
+        if table is None:
+            return []
+
+        query_embedding = await self.embedding_func.aembed_query(query)
+        filters = self._build_filter(expr, table)
+
+        output_fields = kwargs.get("output_fields") or [
+            self._text_field,
+            self._metadata_field,
+            self._doc_id_field,
+            self._kb_id_field,
+            self._file_id_field,
+        ]
+
+        search_res = self._get_client().search(
+            collection_name=self.collection_name,
+            data=self._normalize_vector(query_embedding),
+            filter=filters,
+            limit=k,
+            with_dist=True,
+            output_fields=output_fields,
+            search_params={"metric_type": self.metric_type},
+            timeout=kwargs.get("timeout", self.timeout),
+            anns_field=self._vector_field,
+        )
+
+        result: List[tuple[Document, float]] = []
+        for row in search_res:
+            doc = self._row_to_document(row)
+            score = float(row.get("distance", 0.0))
+            result.append((doc, score))
+        return result
+
+    def similarity_search_with_score(self, *args: Any, **kwargs: Any) -> List[tuple[Document, float]]:
+        return self._run_coro_sync(self.asimilarity_search_with_score(*args, **kwargs))
+
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        **kwargs: Any,
+    ) -> List[Document]:
+        result = self.similarity_search_with_score(query=query, k=k, **kwargs)
+        return [doc for doc, _ in result]
+
+    async def amax_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 4,
+        expr: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        result = await self.asimilarity_search_with_score(query=query, k=k, expr=expr, **kwargs)
+        return [doc for doc, _ in result]
+
+    def max_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        **kwargs: Any,
+    ) -> List[Document]:
+        return self._run_coro_sync(
+            self.amax_marginal_relevance_search(
+                query=query,
+                k=k,
+                fetch_k=fetch_k,
+                lambda_mult=lambda_mult,
+                **kwargs,
+            )
+        )
+
+    def get_pks(self, expr: str, timeout: int = 10) -> List[str]:
+        if not self._check_collection_exists():
+            return []
+
+        table = self._load_table()
+        if table is None:
+            return []
+
+        filters = self._build_filter(expr, table)
+        rows = self._get_client().query(
+            collection_name=self.collection_name,
+            filter=filters,
+            output_fields=[self._primary_field],
+            timeout=timeout,
+        )
+        return [row[self._primary_field] for row in rows if row.get(self._primary_field) is not None]
+
+    def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
+        expr = kwargs.get("expr", "")
+        timeout = kwargs.get("timeout", 10)
+
+        if not expr and ids:
+            expr = f"{self._primary_field} in {ids}"
+
+        if not expr or not str(expr).strip():
+            return True
+
+        if not self._check_collection_exists():
+            return True
+
+        table = self._load_table()
+        if table is None:
+            return True
+
+        filters = self._build_filter(expr, table)
+        if not filters:
+            return True
+
+        res = self._get_client().delete(
+            collection_name=self.collection_name,
+            filter=filters,
+            timeout=timeout,
+        )
+        self._get_client().commit()
+        delete_count = int(res.get("delete_count", 0)) if isinstance(res, dict) else 0
+        return delete_count >= 0
+
+    @classmethod
+    def from_texts(
+        cls,
+        texts: List[str],
+        embedding,
+        metadatas: Optional[List[dict]] = None,
+        **kwargs: Any,
+    ):
+        instance = cls(embedding_function=embedding, **kwargs)
+        instance.add_texts(texts=texts, metadatas=metadatas, **kwargs)
+        return instance
+
+
+class SelfMilvus(SelfDMVectorStore):
+    """Compatibility alias kept for old imports."""
 
 
 class VectorStoreMilvusClient:
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=4)
-        self.host = MILVUS_HOST_LOCAL
-        self.port = MILVUS_PORT
-        self.local_vectorstore: Milvus = SelfMilvus(
+        self.host = DAMENG_HOST_LOCAL
+        self.port = DAMENG_PORT_LOCAL
+        self.local_vectorstore: SelfDMVectorStore = SelfDMVectorStore(
             embedding_function=YouDaoEmbeddings(),
-            connection_args={"host": self.host, "port": self.port},
+            connection_args={
+                "host": self.host,
+                "port": self.port,
+                "user": DAMENG_USER_LOCAL,
+                "password": DAMENG_PASSWORD_LOCAL,
+                "db_name": DAMENG_DATABASE_LOCAL,
+            },
             collection_name=MILVUS_COLLECTION_NAME,
-            partition_key_field="kb_id",
-            # primary_field="doc_id",
             auto_id=True,
-            search_params={"params": {"ef": 64}}
+            search_params={"metric_type": "COSINE"},
         )
-        debug_logger.info(
-            f'init vectorstore {self.host}, {MILVUS_COLLECTION_NAME}')
+        debug_logger.info(f"init vectorstore dm {self.host}:{self.port}, {MILVUS_COLLECTION_NAME}")
 
     def get_local_chunks(self, expr, timeout=10):
-        future = self.executor.submit(
-            partial(self.local_vectorstore.get_pks, expr=expr, timeout=timeout))
+        future = self.executor.submit(partial(self.local_vectorstore.get_pks, expr=expr, timeout=timeout))
         return future.result()
-
-    # def delete_chunks(self, chunk_ids):
-    #     res = self.vectorstore.delete(expr=f"chunk_id in {chunk_ids}")
-    #     debug_logger.info(f'milvus delete chunk number: {len(chunk_ids)} res: {res}')
 
     @get_time
     def delete_expr(self, expr):
-        # 如果expr为空，则不执行删除操作
-        if len(self.get_local_chunks(expr)) == 0:
-            debug_logger.info(f'expr: {expr} not found in local milvus')
+        try:
+            chunks = self.get_local_chunks(expr)
+        except Exception as e:
+            debug_logger.error(f"failed to query chunks before delete, expr: {expr}, error: {e}")
+            return
+
+        if len(chunks) == 0:
+            debug_logger.info(f"expr: {expr} not found in local vectorstore")
             return
         try:
-            res = self.local_vectorstore.delete(expr=expr, timeout=10)
-            debug_logger.info(f'local milvus delete expr: {expr} res: {res}')
+            ok = self.local_vectorstore.delete(expr=expr, timeout=10)
+            res = {"delete_count": len(chunks), "ok": ok}
+            debug_logger.info(f"local vectorstore delete expr: {expr} res: {res}")
         except Exception as e:
-            debug_logger.error(f'local milvus delete expr: {expr} error: {e}')
+            debug_logger.error(f"local vectorstore delete expr: {expr} error: {e}")

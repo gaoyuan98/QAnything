@@ -8,12 +8,11 @@ from qanything_kernel.utils.custom_log import debug_logger, insert_logger
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from qanything_kernel.utils.general_utils import num_tokens_embed, get_time_async
 import copy
-from typing import List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict
 from langchain_core.documents import Document
 from langchain_core.callbacks import (
     AsyncCallbackManagerForRetrieverRun,
 )
-from langchain_community.vectorstores.milvus import Milvus
 from langchain_elasticsearch import ElasticsearchStore
 import time
 import traceback
@@ -179,7 +178,7 @@ class ParentRetriever:
             child_splitter=init_child_splitter,
             parent_splitter=init_parent_splitter,
         )
-        self.backup_vectorstore: Optional[Milvus] = None
+        self.backup_vectorstore: Optional[Any] = None
         self.es_store = es_client.es_store
         self.parent_chunk_size = DEFAULT_PARENT_CHUNK_SIZE
 

@@ -130,7 +130,7 @@ async def process_data(retriever, milvus_kb, mysql_client, file_info, time_recor
     msg = "success"
     chunks_number = 0
     mysql_client.update_file_msg(file_id, f'Processing:{random.randint(1, 5)}%')
-    # 这里是把文件做向量化，然后写入Milvus的逻辑
+    # 这里是把文件做向量化，然后写入向量存储的逻辑
     start = time.perf_counter()
     try:
         await asyncio.wait_for(
@@ -174,25 +174,25 @@ async def process_data(retriever, milvus_kb, mysql_client, file_info, time_recor
         insert_logger.info(f'insert time: {insert_time - start}')
         mysql_client.update_chunks_number(local_file.file_id, chunks_number)
     except asyncio.TimeoutError:
-        insert_logger.error(f'Timeout: milvus insert took longer than {insert_timeout_seconds} seconds')
+        insert_logger.error(f'Timeout: vectorstore insert took longer than {insert_timeout_seconds} seconds')
         expr = f'file_id == \"{local_file.file_id}\"'
         milvus_kb.delete_expr(expr)
         status = 'red'
         time_record['insert_timeout'] = True
-        msg = f"milvus insert timeout: {insert_timeout_seconds}s"
+        msg = f"vectorstore insert timeout: {insert_timeout_seconds}s"
         return status, content_length, chunks_number, msg
     except Exception as e:
-        error_info = f'milvus insert error: {traceback.format_exc()}'
+        error_info = f'vectorstore insert error: {traceback.format_exc()}'
         insert_logger.error(error_info)
         status = 'red'
         time_record['insert_error'] = True
-        msg = f"milvus insert error"
+        msg = f"vectorstore insert error"
         return status, content_length, chunks_number, msg
 
     mysql_client.update_file_msg(file_id, f'Processing:{random.randint(75, 100)}%')
     time_record['upload_total_time'] = round(time.perf_counter() - process_start, 2)
     mysql_client.update_file_upload_infos(file_id, time_record)
-    insert_logger.info(f'insert_files_to_milvus: {user_id}, {kb_id}, {file_id}, {file_name}, {status}')
+    insert_logger.info(f'insert_files_to_vectorstore: {user_id}, {kb_id}, {file_id}, {file_name}, {status}')
     msg = json.dumps(time_record, ensure_ascii=False)
     return status, content_length, chunks_number, msg
 

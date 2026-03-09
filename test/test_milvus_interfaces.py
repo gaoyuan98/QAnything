@@ -6,8 +6,15 @@ import unittest
 import uuid
 from collections import OrderedDict
 
-from pymilvus import connections, utility
 from langchain_core.documents import Document
+
+try:
+    from pymilvus import connections, utility
+    _PYMILVUS_AVAILABLE = True
+except Exception:  # pragma: no cover - import guard for optional dependency
+    connections = None
+    utility = None
+    _PYMILVUS_AVAILABLE = False
 
 from qanything_kernel.configs import model_config
 from qanything_kernel.core.retriever.vectorstore import SelfMilvus
@@ -49,6 +56,9 @@ def _make_vector(dim: int, seed: int = 1):
 class TestMilvusInterfaces(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not _PYMILVUS_AVAILABLE:
+            raise unittest.SkipTest("pymilvus is not installed")
+
         host = os.getenv("QANYTHING_MILVUS_HOST", model_config.MILVUS_HOST_LOCAL)
         port = int(os.getenv("QANYTHING_MILVUS_PORT", model_config.MILVUS_PORT))
         cls.host = host
