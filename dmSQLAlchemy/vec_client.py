@@ -368,15 +368,21 @@ class dmVecClient:
         password: str = "",
         db_name: str = "", #schema
         echo: bool = False,
-        connect_args: dict = {},
+        connect_args: Optional[dict] = None,
         token: str = "", # not used in dm
         timeout: Optional[float] = 0,
         **kwargs,
     ) -> None:
-        connection_str = (
-            f"dm+dmPython://{user}:{password}@{uri}/{db_name}"
-        )
-        self.engine = create_engine(connection_str, echo=echo, connect_args=connect_args)
+        # NOTE:
+        # DM driver expects `schema` in connect args, while URL path may be translated
+        # as `database` by SQLAlchemy URL parser and then rejected by dmPython.connect.
+        # Keep db_name for compatibility, but pass it as `schema`.
+        effective_connect_args = deepcopy(connect_args) if connect_args else {}
+        if db_name and "schema" not in effective_connect_args:
+            effective_connect_args["schema"] = db_name
+
+        connection_str = f"dm+dmPython://{user}:{password}@{uri}"
+        self.engine = create_engine(connection_str, echo=echo, connect_args=effective_connect_args)
         self.conn = self.engine.connect()
         self.connection = self.conn.connection.connection
         self.connection.connection_timeout = timeout
