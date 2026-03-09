@@ -12,6 +12,7 @@ import json
 import uuid
 from datetime import datetime, timedelta
 import re
+from typing import Dict, List
 
 
 class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
@@ -111,6 +112,21 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
     def _is_ignorable_dm_error(self, err):
         msg = str(err).lower()
         return any(token in msg for token in ("already exists", "duplicate", "exists", "not exists", "does not exist"))
+
+    @staticmethod
+    def _normalize_dm_text(value):
+        if value is None:
+            return ""
+        if hasattr(value, "read"):
+            return value.read()
+        return str(value)
+
+    @staticmethod
+    def _split_fulltext_terms(query_text: str) -> List[str]:
+        terms = [term.strip() for term in re.split(r"[\s,;，。！？!?.]+", query_text or "") if term.strip()]
+        if not terms and query_text:
+            terms = [query_text.strip()]
+        return terms[:8]
 
     def check_database_(self, host, port, user, password, database_name):
         conn = self._dm_connect()
@@ -253,6 +269,17 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
         """
         self.execute_query_(query, (), commit=True)
         query = """
+            CREATE TABLE DocumentFulltextIndex (
+                id INTEGER IDENTITY(1,1) PRIMARY KEY,
+                doc_id VARCHAR(255) UNIQUE,
+                kb_id VARCHAR(255) NOT NULL,
+                file_id VARCHAR(255) NOT NULL,
+                content CLOB,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        self.execute_query_(query, (), commit=True)
+        query = """
             CREATE TABLE QaLogs (
                 id INTEGER IDENTITY(1,1) PRIMARY KEY,
                 qa_id VARCHAR(255) UNIQUE,
@@ -310,6 +337,8 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
             "CREATE INDEX index_bot_id ON QaLogs (bot_id)",
             "CREATE INDEX index_query ON QaLogs (query)",
             "CREATE INDEX index_timestamp ON QaLogs (timestamp)",
+            "CREATE INDEX idx_fulltext_kb_file ON DocumentFulltextIndex (kb_id, file_id)",
+            "CREATE CONTEXT INDEX idx_fulltext_content ON DocumentFulltextIndex(content)",
             "ALTER TABLE QanythingBot ADD COLUMN llm_setting VARCHAR(512) DEFAULT '{}'",
             "ALTER TABLE QanythingBot DROP COLUMN \"MODEL\"",
         ]
@@ -479,3 +508,175 @@ class KnowledgeBaseManager(MysqlKnowledgeBaseManager):
         json_data = json.dumps(json_data, ensure_ascii=False)
         query = "INSERT INTO Documents (doc_id, json_data) VALUES (%s, %s)"
         self.execute_query_(query, (doc_id, json_data), commit=True, check=True)
+
+    def upsert_fulltext_documents(self, records: List[Dict]) -> int:
+        upserted = 0
+        for item in records:
+            doc_id = item.get("doc_id")
+            kb_id = item.get("kb_id")
+            file_id = item.get("file_id")
+            content = item.get("content", "")
+            if not doc_id or not kb_id or not file_id:
+                continue
+            update_query = """
+                UPDATE DocumentFulltextIndex
+                SET kb_id = %s, file_id = %s, content = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE doc_id = %s
+            """
+            updated = self.execute_query_(update_query, (kb_id, file_id, content, doc_id), commit=True, check=True)
+            if updated is None:
+                continue
+            if updated == 0:
+                insert_query = """
+                    INSERT INTO DocumentFulltextIndex (doc_id, kb_id, file_id, content)
+                    VALUES (%s, %s, %s, %s)
+                """
+                inserted = self.execute_query_(insert_query, (doc_id, kb_id, file_id, content), commit=True, check=True)
+                if inserted:
+                    upserted += 1
+            else:
+                upserted += int(updated)
+        return upserted
+
+    def query_fulltext_documents(self, query_text: str, kb_ids: List[str], limit: int = 30) -> List[Dict]:
+        if not query_text or not kb_ids:
+            return []
+        placeholders = ",".join(["%s"] * len(kb_ids))
+
+        contains_sqls = [
+            (
+                f"""
+                SELECT doc_id, kb_id, file_id, content, CONTAINS(content, %s) AS score
+                FROM DocumentFulltextIndex
+                WHERE kb_id IN ({placeholders}) AND CONTAINS(content, %s) > 0
+                ORDER BY score DESC
+                FETCH FIRST %s ROWS ONLY
+                """,
+                [query_text, *kb_ids, query_text, limit],
+            ),
+            (
+                f"""
+                SELECT doc_id, kb_id, file_id, content, CONTAINS(content, %s) AS score
+                FROM DocumentFulltextIndex
+                WHERE kb_id IN ({placeholders}) AND CONTAINS(content, %s) > 0
+                ORDER BY score DESC
+                LIMIT %s
+                """,
+                [query_text, *kb_ids, query_text, limit],
+            ),
+        ]
+        for sql, params in contains_sqls:
+            rows = self.execute_query_(sql, tuple(params), fetch=True)
+            if rows:
+                return [
+                    {
+                        "doc_id": row[0],
+                        "kb_id": row[1],
+                        "file_id": row[2],
+                        "content": self._normalize_dm_text(row[3]),
+                        "score": float(row[4]) if row[4] is not None else 0.0,
+                    }
+                    for row in rows
+                ]
+            if rows is None:
+                continue
+
+        terms = self._split_fulltext_terms(query_text)
+        if not terms:
+            return []
+        score_expr = " + ".join(["CASE WHEN content LIKE %s THEN 1 ELSE 0 END" for _ in terms])
+        like_filter = " OR ".join(["content LIKE %s" for _ in terms])
+        like_params = [f"%{term}%" for term in terms]
+        like_sqls = [
+            (
+                f"""
+                SELECT doc_id, kb_id, file_id, content, ({score_expr}) AS score
+                FROM DocumentFulltextIndex
+                WHERE kb_id IN ({placeholders}) AND ({like_filter})
+                ORDER BY score DESC
+                FETCH FIRST %s ROWS ONLY
+                """,
+                [*like_params, *kb_ids, *like_params, limit],
+            ),
+            (
+                f"""
+                SELECT doc_id, kb_id, file_id, content, ({score_expr}) AS score
+                FROM DocumentFulltextIndex
+                WHERE kb_id IN ({placeholders}) AND ({like_filter})
+                ORDER BY score DESC
+                LIMIT %s
+                """,
+                [*like_params, *kb_ids, *like_params, limit],
+            ),
+        ]
+        for sql, params in like_sqls:
+            rows = self.execute_query_(sql, tuple(params), fetch=True)
+            if rows:
+                return [
+                    {
+                        "doc_id": row[0],
+                        "kb_id": row[1],
+                        "file_id": row[2],
+                        "content": self._normalize_dm_text(row[3]),
+                        "score": float(row[4]) if row[4] is not None else 0.0,
+                    }
+                    for row in rows
+                ]
+            if rows is None:
+                continue
+        return []
+
+    def delete_fulltext_documents_by_ids(self, doc_ids: List[str]) -> int:
+        if not doc_ids:
+            return 0
+        deleted = 0
+        batch_size = 200
+        for i in range(0, len(doc_ids), batch_size):
+            batch_doc_ids = doc_ids[i:i + batch_size]
+            placeholders = ",".join(["%s"] * len(batch_doc_ids))
+            query = f"DELETE FROM DocumentFulltextIndex WHERE doc_id IN ({placeholders})"
+            res = self.execute_query_(query, tuple(batch_doc_ids), commit=True, check=True)
+            if res:
+                deleted += int(res)
+        return deleted
+
+    def delete_fulltext_documents_by_file_ids(self, file_ids: List[str]) -> int:
+        if not file_ids:
+            return 0
+        deleted = 0
+        batch_size = 200
+        for i in range(0, len(file_ids), batch_size):
+            batch_file_ids = file_ids[i:i + batch_size]
+            placeholders = ",".join(["%s"] * len(batch_file_ids))
+            query = f"DELETE FROM DocumentFulltextIndex WHERE file_id IN ({placeholders})"
+            res = self.execute_query_(query, tuple(batch_file_ids), commit=True, check=True)
+            if res:
+                deleted += int(res)
+        return deleted
+
+    def get_fulltext_backfill_source_documents(self) -> List[Dict]:
+        rows = self.execute_query_("SELECT doc_id, json_data FROM Documents", (), fetch=True) or []
+        results = []
+        for row in rows:
+            doc_id = row[0]
+            raw_json = self._normalize_dm_text(row[1])
+            try:
+                doc_json = json.loads(raw_json)
+            except Exception:
+                continue
+            kwargs = doc_json.get("kwargs", {})
+            metadata = kwargs.get("metadata", {})
+            kb_id = metadata.get("kb_id")
+            file_id = metadata.get("file_id")
+            content = kwargs.get("page_content", "")
+            if not kb_id or not file_id:
+                continue
+            results.append(
+                {
+                    "doc_id": doc_id,
+                    "kb_id": kb_id,
+                    "file_id": file_id,
+                    "content": content,
+                }
+            )
+        return results

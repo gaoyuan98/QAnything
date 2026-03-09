@@ -61,3 +61,4 @@ PyPDF2==3.0.1
 lxml_html_clean==0.1.1
 docx2txt==0.8
 ipython==8.18.1
+httpx<0.28

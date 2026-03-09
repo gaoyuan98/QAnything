@@ -1,6 +1,6 @@
 from langchain.retrievers import ParentDocumentRetriever
 from qanything_kernel.core.retriever.vectorstore import VectorStoreMilvusClient
-from qanything_kernel.core.retriever.elasticsearchstore import StoreElasticSearchClient
+from qanything_kernel.core.retriever.dm_fulltextstore import StoreDMFullTextClient
 from qanything_kernel.connector.database.db_client import KnowledgeBaseManager
 from qanything_kernel.core.retriever.docstrore import MysqlStore
 from qanything_kernel.configs.model_config import DEFAULT_CHILD_CHUNK_SIZE, DEFAULT_PARENT_CHUNK_SIZE, SEPARATORS
@@ -13,7 +13,6 @@ from langchain_core.documents import Document
 from langchain_core.callbacks import (
     AsyncCallbackManagerForRetrieverRun,
 )
-from langchain_elasticsearch import ElasticsearchStore
 import time
 import traceback
 
@@ -71,7 +70,7 @@ class SelfParentRetriever(ParentDocumentRetriever):
             ids: Optional[List[str]] = None,
             add_to_docstore: bool = True,
             parent_chunk_size: Optional[int] = None,
-            es_store: Optional[ElasticsearchStore] = None,
+            fulltext_store: Optional[StoreDMFullTextClient] = None,
             single_parent: bool = False,
     ) -> Tuple[int, Dict]:
         # insert_logger.info(f"Inserting {len(documents)} complete documents, single_parent: {single_parent}")
@@ -139,16 +138,19 @@ class SelfParentRetriever(ParentDocumentRetriever):
 
         res = await self.vectorstore.aadd_documents(embed_docs, time_record=time_record)
         insert_logger.info(f'vectorstore insert number: {len(res)}, {res[0]}')
-        if es_store is not None:
+        if fulltext_store is not None:
             try:
-                es_start = time.perf_counter()
+                fulltext_start = time.perf_counter()
                 # docs的doc_id是file_id + '_' + i
                 docs_ids = [doc.metadata['file_id'] + '_' + str(i) for i, doc in enumerate(embed_docs)]
-                es_res = await es_store.aadd_documents(embed_docs, ids=docs_ids)
-                time_record['es_insert_time'] = round(time.perf_counter() - es_start, 2)
-                insert_logger.info(f'es_store insert number: {len(es_res)}, {es_res[0]}')
+                fulltext_res = await fulltext_store.aadd_documents(embed_docs, ids=docs_ids)
+                fulltext_insert_time = round(time.perf_counter() - fulltext_start, 2)
+                time_record['fulltext_insert_time'] = fulltext_insert_time
+                time_record['es_insert_time'] = fulltext_insert_time
+                if fulltext_res:
+                    insert_logger.info(f'fulltext_store insert number: {len(fulltext_res)}, {fulltext_res[0]}')
             except Exception as e:
-                insert_logger.error(f"Error in aadd_documents on es_store: {traceback.format_exc()}")
+                insert_logger.error(f"Error in aadd_documents on fulltext_store: {traceback.format_exc()}")
 
         if add_to_docstore:
             await self.docstore.amset(full_docs)
@@ -156,7 +158,7 @@ class SelfParentRetriever(ParentDocumentRetriever):
 
 
 class ParentRetriever:
-    def __init__(self, vectorstore_client: VectorStoreMilvusClient, mysql_client: KnowledgeBaseManager, es_client: StoreElasticSearchClient):
+    def __init__(self, vectorstore_client: VectorStoreMilvusClient, mysql_client: KnowledgeBaseManager, fulltext_client: Optional[StoreDMFullTextClient] = None):
         self.mysql_client = mysql_client
         self.vectorstore_client = vectorstore_client
         # This text splitter is used to create the parent documents
@@ -179,7 +181,7 @@ class ParentRetriever:
             parent_splitter=init_parent_splitter,
         )
         self.backup_vectorstore: Optional[Any] = None
-        self.es_store = es_client.es_store
+        self.fulltext_store = fulltext_client
         self.parent_chunk_size = DEFAULT_PARENT_CHUNK_SIZE
 
     @get_time_async
@@ -207,7 +209,8 @@ class ParentRetriever:
         # insert_logger.info(f'insert documents: {len(docs)}')
         ids = None if not single_parent else [doc.metadata['doc_id'] for doc in docs]
         return await self.retriever.aadd_documents(docs, parent_chunk_size=parent_chunk_size,
-                                                   es_store=self.es_store, ids=ids, single_parent=single_parent)
+                                                   fulltext_store=self.fulltext_store, ids=ids,
+                                                   single_parent=single_parent)
 
     async def get_retrieved_documents(self, query: str, partition_keys: List[str], time_record: dict,
                                       hybrid_search: bool, top_k: int):
@@ -223,24 +226,28 @@ class ParentRetriever:
 
         if not hybrid_search:
             return query_docs
+        if self.fulltext_store is None:
+            debug_logger.warning("hybrid_search=True but fulltext_store is not configured, skip fulltext search")
+            return query_docs
 
         try:
-            # filter = []
-            # for partition_key in partition_keys:
-            filter = [{"terms": {"metadata.kb_id.keyword": partition_keys}}]
-            es_sub_docs = await self.es_store.asimilarity_search(query, k=top_k, filter=filter)
-            es_ids = []
+            fulltext_sub_docs = await self.fulltext_store.asimilarity_search(query, k=top_k, kb_ids=partition_keys)
+            fulltext_ids = []
             milvus_doc_ids = [d.metadata[self.retriever.id_key] for d in query_docs]
-            for d in es_sub_docs:
-                if self.retriever.id_key in d.metadata and d.metadata[self.retriever.id_key] not in es_ids and d.metadata[self.retriever.id_key] not in milvus_doc_ids:
-                    es_ids.append(d.metadata[self.retriever.id_key])
-            es_docs = await self.retriever.docstore.amget(es_ids)
-            es_docs = [d for d in es_docs if d is not None]
-            for doc in es_docs:
-                doc.metadata['retrieval_source'] = 'es'
-            time_record['retriever_search_by_es'] = round(time.perf_counter() - milvus_end_time, 2)
-            debug_logger.info(f"Got {len(query_docs)} documents from vectorstore and {len(es_sub_docs)} documents from es, total {len(query_docs) + len(es_docs)} merged documents.")
-            query_docs.extend(es_docs)
+            for d in fulltext_sub_docs:
+                if self.retriever.id_key in d.metadata and d.metadata[self.retriever.id_key] not in fulltext_ids and d.metadata[self.retriever.id_key] not in milvus_doc_ids:
+                    fulltext_ids.append(d.metadata[self.retriever.id_key])
+            fulltext_docs = await self.retriever.docstore.amget(fulltext_ids)
+            fulltext_docs = [d for d in fulltext_docs if d is not None]
+            for doc in fulltext_docs:
+                doc.metadata['retrieval_source'] = 'dm_fulltext'
+            fulltext_search_time = round(time.perf_counter() - milvus_end_time, 2)
+            time_record['retriever_search_by_fulltext'] = fulltext_search_time
+            time_record['retriever_search_by_es'] = fulltext_search_time
+            debug_logger.info(
+                f"Got {len(query_docs)} documents from vectorstore and {len(fulltext_sub_docs)} documents from fulltext, total {len(query_docs) + len(fulltext_docs)} merged documents."
+            )
+            query_docs.extend(fulltext_docs)
         except Exception as e:
-            debug_logger.error(f"Error in get_retrieved_documents on es_search: {e}")
+            debug_logger.error(f"Error in get_retrieved_documents on fulltext_search: {e}")
         return query_docs

@@ -176,6 +176,7 @@ ES_USER = None
 ES_PASSWORD = None
 ES_TOP_K = 30
 ES_INDEX_NAME = 'qanything_es_index' + KB_SUFFIX
+DM_FULLTEXT_TOP_K = 30
 
 # MYSQL_HOST_LOCAL = 'mysql-container-local'
 # MYSQL_PORT_LOCAL = 3306

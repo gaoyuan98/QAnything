@@ -14,7 +14,7 @@ from langchain.schema.messages import AIMessage, HumanMessage
 from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
 from qanything_kernel.connector.database.db_client import KnowledgeBaseManager
 from qanything_kernel.core.retriever.vectorstore import VectorStoreMilvusClient
-from qanything_kernel.core.retriever.elasticsearchstore import StoreElasticSearchClient
+from qanything_kernel.core.retriever.dm_fulltextstore import StoreDMFullTextClient
 from qanything_kernel.core.retriever.parent_retriever import ParentRetriever
 from qanything_kernel.utils.general_utils import (get_time, clear_string, get_time_async, num_tokens,
                                                   cosine_similarity, clear_string_is_equal, num_tokens_embed,
@@ -43,7 +43,7 @@ class LocalDocQA:
         self.milvus_kb: VectorStoreMilvusClient = None
         self.retriever: ParentRetriever = None
         self.milvus_summary: KnowledgeBaseManager = None
-        self.es_client: StoreElasticSearchClient = None
+        self.fulltext_client: StoreDMFullTextClient = None
         self.session = self.create_retry_session(retries=3, backoff_factor=1)
         self.doc_splitter = CharacterTextSplitter(
             chunk_size=LOCAL_EMBED_MAX_LENGTH / 2,
@@ -71,8 +71,8 @@ class LocalDocQA:
         self.rerank = YouDaoRerank()
         self.milvus_summary = KnowledgeBaseManager()
         self.milvus_kb = VectorStoreMilvusClient()
-        self.es_client = StoreElasticSearchClient()
-        self.retriever = ParentRetriever(self.milvus_kb, self.milvus_summary, self.es_client)
+        self.fulltext_client = StoreDMFullTextClient(self.milvus_summary)
+        self.retriever = ParentRetriever(self.milvus_kb, self.milvus_summary, self.fulltext_client)
 
     @get_time
     def get_web_search(self, queries, top_k):
