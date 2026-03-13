@@ -25,7 +25,7 @@ import asyncio
 import traceback
 import time
 import random
-import aiomysql
+import dmAsync
 import argparse
 import json
 
@@ -49,8 +49,12 @@ db_config = {
     'port': MYSQL_PORT_LOCAL,
     'user': MYSQL_USER_LOCAL,
     'password': MYSQL_PASSWORD_LOCAL,
-    'db': MYSQL_DATABASE_LOCAL,
+    'schema': MYSQL_DATABASE_LOCAL,
 }
+
+
+def dm_query(query):
+    return query.replace('%s', '?')
 
 
 @get_time_async
@@ -159,7 +163,7 @@ async def check_and_process(pool):
                         ORDER BY timestamp ASC LIMIT 1;
                     """
 
-                    await cur.execute(query, (INSERT_WORKERS, dynamic_worker_id))
+                    await cur.execute(dm_query(query), (INSERT_WORKERS, dynamic_worker_id))
 
                     file_to_update = await cur.fetchone()
 
@@ -170,16 +174,17 @@ async def check_and_process(pool):
 
                         id, timestamp, file_id, file_name = file_to_update
                         # 更新这条记录的状态
-                        await cur.execute("""
+                        await cur.execute(dm_query("""
                             UPDATE File SET status='yellow'
                             WHERE id=%s;
-                        """, (id,))
+                        """), (id,))
                         await conn.commit()
                         insert_logger.info(f"UPDATE FILE: {timestamp}, {file_id}, {file_name}, yellow")
 
                         await cur.execute(
+                            dm_query(
                             "SELECT id, file_id, user_id, file_name, kb_id, file_location, file_size, file_url, "
-                            "chunk_size FROM File WHERE id=%s", (id,))
+                            "chunk_size FROM File WHERE id=%s"), (id,))
                         file_info = await cur.fetchone()
 
                         time_record = {}
@@ -191,8 +196,9 @@ async def check_and_process(pool):
                         insert_logger.info('time_record: ' + json.dumps(time_record, ensure_ascii=False))
                         # 更新文件处理后的状态和相关信息
                         await cur.execute(
+                            dm_query(
                             "UPDATE File SET status=%s, content_length=%s, chunks_number=%s, msg=%s WHERE id=%s",
-                            (status, content_length, chunks_number, msg, file_info[0]))
+                            ), (status, content_length, chunks_number, msg, file_info[0]))
                         await conn.commit()
                         insert_logger.info(f"UPDATE FILE: {timestamp}, {file_id}, {file_name}, {status}")
                         sleep_time = 0.1
@@ -206,12 +212,13 @@ async def check_and_process(pool):
                         insert_logger.error(f"process_files Error {traceback.format_exc()}")
                         # 如果file的status是yellow，就改为red
                         if id is not None:
-                            await cur.execute("UPDATE File SET status='red' WHERE id=%s AND status='yellow'", (id,))
+                            await cur.execute(dm_query("UPDATE File SET status='red' WHERE id=%s AND status='yellow'"), (id,))
                             await conn.commit()
 
                             await cur.execute(
+                                dm_query(
                                 "SELECT id, file_id, user_id, file_name, kb_id, file_location, file_size FROM File WHERE id=%s",
-                                (id,))
+                                ), (id,))
                             file_info = await cur.fetchone()
 
                             insert_logger.info(f"UPDATE FILE: {timestamp}, {file_id}, {file_name}, yellow2red")
@@ -233,8 +240,8 @@ async def close_db(app, loop):
 @app.listener('before_server_start')
 async def setup_workers(app, loop):
     # 创建数据库连接池
-    app.ctx.pool = await aiomysql.create_pool(**db_config, minsize=1, maxsize=16, loop=loop, autocommit=False,
-                                              init_command='SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED')  # 更改事务隔离级别
+    app.ctx.pool = await dmAsync.create_pool(**db_config, minsize=1, maxsize=16, timeout=60,
+                                             pool_recycle=3600, autoCommit=False)
     app.add_task(check_and_process(app.ctx.pool))
 
 

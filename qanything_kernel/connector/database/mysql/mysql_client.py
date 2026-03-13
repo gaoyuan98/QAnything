@@ -2,14 +2,19 @@ from qanything_kernel.configs.model_config import (MYSQL_HOST_LOCAL, MYSQL_PORT_
                                                    MYSQL_PASSWORD_LOCAL,
                                                    MYSQL_DATABASE_LOCAL, KB_SUFFIX, MILVUS_HOST_LOCAL)
 from qanything_kernel.utils.custom_log import debug_logger, insert_logger
-import mysql.connector
-from mysql.connector import pooling
+import dmPython
 import json
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
 from collections import defaultdict
-from mysql.connector.errors import Error as MySQLError
+from dbutils.pooled_db import PooledDB
+
+
+DMError = dmPython.Error
+DMIntegrityError = dmPython.IntegrityError
+DM_RESERVED_USER_TABLE = '"USER"'
+DM_RESERVED_MODEL_COLUMN = '"MODEL"'
 
 
 class KnowledgeBaseManager:
@@ -21,119 +26,148 @@ class KnowledgeBaseManager:
         database = MYSQL_DATABASE_LOCAL
 
         self.check_database_(host, port, user, password, database)
-        dbconfig = {
-            "host": host,
-            "user": user,
-            "port": port,
-            "password": password,
-            "database": database,
-        }
-        self.cnxpool = pooling.MySQLConnectionPool(pool_size=pool_size, pool_reset_session=True, **dbconfig)
+        self.pool = PooledDB(
+            creator=dmPython,
+            mincached=1,
+            maxcached=pool_size,
+            maxconnections=pool_size,
+            blocking=True,
+            ping=1,
+            user=user,
+            password=password,
+            dsn=f"{host}:{port}",
+            schema=database,
+            autoCommit=False,
+            login_timeout=5,
+        )
         self.free_cnx = pool_size
         self.used_cnx = 0
         self.create_tables_()
-        debug_logger.info("[SUCCESS] 数据库{}连接成功".format(database))
+        debug_logger.info("[SUCCESS] Database {} connected".format(database))
 
     def check_database_(self, host, port, user, password, database_name):
-        # 连接 MySQL 服务器
-        cnx = mysql.connector.connect(
-            host=host,
-            port=port,
+        cnx = dmPython.connect(
             user=user,
-            password=password
+            password=password,
+            dsn=f"{host}:{port}",
+            schema=database_name,
+            autoCommit=False,
+            login_timeout=5,
         )
-
-        # 检查数据库是否存在
-        cursor = cnx.cursor(buffered=True)
-        cursor.execute('SHOW DATABASES')
-        databases = [database[0] for database in cursor]
-
-        if database_name not in databases:
-            # 如果数据库不存在，则新建数据库
-            cursor.execute('CREATE DATABASE IF NOT EXISTS {}'.format(database_name))
-            debug_logger.info("数据库{}新建成功或已存在".format(database_name))
-        debug_logger.info("[SUCCESS] 数据库{}检查通过".format(database_name))
-        # 关闭游标
-        cursor.close()
-        # 连接到数据库
-        cnx.database = database_name
-        # 关闭数据库连接
+        debug_logger.info("[SUCCESS] Database {} checked".format(database_name))
         cnx.close()
 
-    def execute_query_(self, query, params, commit=False, fetch=False, check=False, user_dict=False):
+    @staticmethod
+    def _prepare_query(query):
+        return query.replace('%s', '?')
+
+    @staticmethod
+    def _normalize_params(params):
+        if params is None:
+            return ()
+        if isinstance(params, tuple):
+            return params
+        if isinstance(params, list):
+            return tuple(params)
+        return (params,)
+
+    @staticmethod
+    def _rows_to_dicts(cursor, rows):
+        columns = [description[0].lower() for description in cursor.description or []]
+        return [dict(zip(columns, row)) for row in rows]
+
+    @staticmethod
+    def _is_object_exists_error(error):
+        error_text = str(error).lower()
+        return any(keyword in error_text for keyword in ['already exists', '\u5df2\u5b58\u5728', '\u91cd\u590d'])
+
+    @staticmethod
+    def _is_object_missing_error(error):
+        error_text = str(error).lower()
+        return any(keyword in error_text for keyword in ['does not exist', '\u4e0d\u5b58\u5728', 'invalid identifier'])
+
+    @staticmethod
+    def _normalize_column_name(column_name):
+        if column_name.lower() == 'model':
+            return DM_RESERVED_MODEL_COLUMN
+        return column_name
+
+    def _normalize_select_fields(self, need_info):
+        return [self._normalize_column_name(column_name) for column_name in need_info]
+
+    def execute_query_(self, query, params, commit=False, fetch=False, check=False, user_dict=False, raise_on_error=False):
+        conn = None
+        cursor = None
         try:
-            conn = self.cnxpool.get_connection()
+            conn = self.pool.connection()
             self.used_cnx += 1
             self.free_cnx -= 1
             if self.free_cnx < 4:
-                debug_logger.info("获取连接成功，当前连接池状态：空闲连接数 {}，已使用连接数 {}".format(
+                debug_logger.info("Get connection success, free: {}, used: {}".format(
                     self.free_cnx, self.used_cnx))
-        except MySQLError as err:
-            debug_logger.error("从连接池获取连接失败：{}".format(err))
+        except DMError as err:
+            debug_logger.error("Get connection from pool failed: {}".format(err))
             return None
 
         result = None
-        cursor = None
         try:
-            if user_dict:
-                cursor = conn.cursor(dictionary=True)
-            else:
-                cursor = conn.cursor(buffered=True)
-            cursor.execute(query, params)
+            cursor = conn.cursor()
+            cursor.execute(self._prepare_query(query), self._normalize_params(params))
 
             if commit:
                 conn.commit()
 
             if fetch:
-                result = cursor.fetchall()
+                rows = cursor.fetchall()
+                result = self._rows_to_dicts(cursor, rows) if user_dict else rows
             elif check:
                 result = cursor.rowcount
-        except MySQLError as err:
-            if err.errno == 1061:
-                debug_logger.info(f"Index already exists (this is okay): {query}")
-            else:
-                debug_logger.error("执行数据库操作失败：{}，SQL：{}".format(err, query))
-            if commit:
+        except DMError as err:
+            debug_logger.error("Execute query failed: {}, SQL: {}".format(err, query))
+            if commit and conn is not None:
                 conn.rollback()
+            if raise_on_error:
+                raise
         finally:
             if cursor is not None:
                 cursor.close()
-            conn.close()
+            if conn is not None:
+                conn.close()
             self.used_cnx -= 1
             self.free_cnx += 1
             if self.free_cnx <= 4:
-                debug_logger.info("连接关闭，返回连接池。当前连接池状态：空闲连接数 {}，已使用连接数 {}".format(
+                debug_logger.info("Connection returned, free: {}, used: {}".format(
                     self.free_cnx, self.used_cnx))
 
         return result
 
     def create_tables_(self):
         query = """
-            CREATE TABLE IF NOT EXISTS User (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS "USER" (
+                id INT IDENTITY(1, 1) PRIMARY KEY,
                 user_id VARCHAR(255) UNIQUE,
                 user_name VARCHAR(255),
                 creation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+            )
         """
-
         self.execute_query_(query, (), commit=True)
+
         query = """
             CREATE TABLE IF NOT EXISTS KnowledgeBase (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id INT IDENTITY(1, 1) PRIMARY KEY,
                 kb_id VARCHAR(255) UNIQUE,
                 user_id VARCHAR(255),
                 kb_name VARCHAR(255),
-                deleted BOOL DEFAULT 0,
+                deleted INT DEFAULT 0,
                 latest_qa_time TIMESTAMP,
                 latest_insert_time TIMESTAMP
-            );
-
+            )
         """
         self.execute_query_(query, (), commit=True)
+
         query = """
             CREATE TABLE IF NOT EXISTS File (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id INT IDENTITY(1, 1) PRIMARY KEY,
                 file_id VARCHAR(255) UNIQUE,
                 user_id VARCHAR(255) DEFAULT 'unknown',
                 kb_id VARCHAR(255),
@@ -141,142 +175,129 @@ class KnowledgeBaseManager:
                 status VARCHAR(255),
                 msg VARCHAR(255) DEFAULT 'success',
                 transfer_status VARCHAR(255),
-                deleted BOOL DEFAULT 0,
+                deleted INT DEFAULT 0,
                 file_size INT DEFAULT -1,
                 content_length INT DEFAULT -1,
                 chunks_number INT DEFAULT -1,
                 file_location VARCHAR(255) DEFAULT 'unknown',
                 file_url VARCHAR(2048) DEFAULT '',
-                upload_infos TEXT,
+                upload_infos CLOB,
                 chunk_size INT DEFAULT -1,
                 timestamp VARCHAR(255) DEFAULT '197001010000'
-            );
-
+            )
         """
         self.execute_query_(query, (), commit=True)
 
-        # create_index_query = "CREATE INDEX IF NOT EXISTS index_kb_id_deleted ON File (kb_id, deleted);"
-        # self.execute_query_(create_index_query, (), commit=True)
-        # create_index_query = "CREATE INDEX idx_user_id_status ON File (user_id, status);"
-        # self.execute_query_(create_index_query, (), commit=True)
-
         query = """
             CREATE TABLE IF NOT EXISTS Faqs (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                faq_id  VARCHAR(255) UNIQUE,
+                id INT IDENTITY(1, 1) PRIMARY KEY,
+                faq_id VARCHAR(255) UNIQUE,
                 user_id VARCHAR(255) NOT NULL,
                 kb_id VARCHAR(255) NOT NULL,
                 question VARCHAR(512) NOT NULL,
                 answer VARCHAR(2048) NOT NULL,
                 nos_keys VARCHAR(768)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            )
         """
         self.execute_query_(query, (), commit=True)
 
         query = """
             CREATE TABLE IF NOT EXISTS Documents (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id INT IDENTITY(1, 1) PRIMARY KEY,
                 doc_id VARCHAR(255) UNIQUE,
-                json_data LONGTEXT
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                json_data CLOB
+            )
         """
-
         self.execute_query_(query, (), commit=True)
-        # 创建一个QaLogs表，用于记录用户的操作日志
-        """
-        chat_data = {'user_id': user_id, 'kb_ids': kb_ids, 'query': question, "model": model, "product_source": request_source,
-                     'time_record': time_record, 'history': history,
-                     'condense_question': resp['condense_question'],
-                     'prompt': resp['prompt'], 'result': next_history[-1][1],
-                     'retrieval_documents': retrieval_documents, 'source_documents': source_documents}
-        """
-        # 其中kb_ids是一个List[str], time_record是Dict，history是List[List[str]], retrieval_documents是List[Dict], source_documents是List[Dict]，其他项都是str
+
         query = """
             CREATE TABLE IF NOT EXISTS QaLogs (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id INT IDENTITY(1, 1) PRIMARY KEY,
                 qa_id VARCHAR(255) UNIQUE,
                 user_id VARCHAR(255) NOT NULL,
                 bot_id VARCHAR(255),
                 kb_ids VARCHAR(2048) NOT NULL,
                 query VARCHAR(512) NOT NULL,
-                model VARCHAR(64) NOT NULL,
+                "MODEL" VARCHAR(64) NOT NULL,
                 product_source VARCHAR(64) NOT NULL,
                 time_record VARCHAR(512) NOT NULL,
-                history MEDIUMTEXT NOT NULL,
+                history CLOB NOT NULL,
                 condense_question VARCHAR(1024) NOT NULL,
-                prompt MEDIUMTEXT NOT NULL,
-                result TEXT NOT NULL,
-                retrieval_documents MEDIUMTEXT NOT NULL,
-                source_documents MEDIUMTEXT NOT NULL,
+                prompt CLOB NOT NULL,
+                result CLOB NOT NULL,
+                retrieval_documents CLOB NOT NULL,
+                source_documents CLOB NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            )
         """
         self.execute_query_(query, (), commit=True)
 
-        # create_index_query = "CREATE INDEX IF NOT EXISTS index_bot_id ON QaLogs (bot_id);"
-        # self.execute_query_(create_index_query, (), commit=True)
-        # create_index_query = "CREATE INDEX IF NOT EXISTS index_query ON QaLogs (query);"
-        # self.execute_query_(create_index_query, (), commit=True)
-        # create_index_query = "CREATE INDEX IF NOT EXISTS index_timestamp ON QaLogs (timestamp);"
-        # self.execute_query_(create_index_query, (), commit=True)
-
         query = """
             CREATE TABLE IF NOT EXISTS FileImages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id INT IDENTITY(1, 1) PRIMARY KEY,
                 image_id VARCHAR(255) UNIQUE,
                 file_id VARCHAR(255) NOT NULL,
                 user_id VARCHAR(255) NOT NULL,
                 kb_id VARCHAR(255) NOT NULL,
                 nos_key VARCHAR(255) NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            )
         """
         self.execute_query_(query, (), commit=True)
 
         query = """
             CREATE TABLE IF NOT EXISTS QanythingBot (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                bot_id          VARCHAR(64) UNIQUE,
-                user_id         VARCHAR(255),
-                bot_name        VARCHAR(512),
-                description     VARCHAR(512),
-                head_image      VARCHAR(512),
-                prompt_setting  MEDIUMTEXT,
-                welcome_message MEDIUMTEXT,
-                kb_ids_str      VARCHAR(1024),
-                deleted         INT DEFAULT 0,
-                create_time     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                update_time     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                llm_setting     VARCHAR(512) DEFAULT '{}'
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                id INT IDENTITY(1, 1) PRIMARY KEY,
+                bot_id VARCHAR(64) UNIQUE,
+                user_id VARCHAR(255),
+                bot_name VARCHAR(512),
+                description VARCHAR(512),
+                head_image VARCHAR(512),
+                prompt_setting CLOB,
+                welcome_message CLOB,
+                kb_ids_str VARCHAR(1024),
+                deleted INT DEFAULT 0,
+                create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                llm_setting VARCHAR(512) DEFAULT '{}'
+            )
         """
         self.execute_query_(query, (), commit=True)
 
-        # 修改索引创建方式
         index_queries = [
             "CREATE INDEX index_kb_id_deleted ON File (kb_id, deleted)",
             "CREATE INDEX idx_user_id_status ON File (user_id, status)",
             "CREATE INDEX index_bot_id ON QaLogs (bot_id)",
             "CREATE INDEX index_query ON QaLogs (query)",
             "CREATE INDEX index_timestamp ON QaLogs (timestamp)",
-            # 如果没有的话，给QanythingBot添加一列：llm_setting VARCHAR(512)
-            "ALTER TABLE QanythingBot ADD COLUMN llm_setting VARCHAR(512) DEFAULT '{}'",
-            "ALTER TABLE QanythingBot DROP COLUMN model",
         ]
 
         for query in index_queries:
             try:
-                self.execute_query_(query, (), commit=True)
+                self.execute_query_(query, (), commit=True, raise_on_error=True)
                 debug_logger.info(f"Index created successfully: {query}")
-            except mysql.connector.Error as err:
-                if err.errno == 1061:  # 重复键错误
+            except DMError as err:
+                if self._is_object_exists_error(err):
                     debug_logger.info(f"Index already exists (this is okay): {query}")
-                elif err.errno == 1060:  # 已存在的列无需创建
-                    debug_logger.info(f"Column already exists (this is okay): {query}")
-                elif err.errno == 1091:  # 已经删除的列无需删除
-                    debug_logger.info(f"Column already deleted (this is okay): {query}")
                 else:
                     debug_logger.error(f"Error creating index: {err}")
+
+        try:
+            self.execute_query_(
+                "ALTER TABLE QanythingBot ADD COLUMN llm_setting VARCHAR(512) DEFAULT '{}'",
+                (),
+                commit=True,
+                raise_on_error=True,
+            )
+        except DMError as err:
+            if not self._is_object_exists_error(err):
+                debug_logger.error(f"Error adding llm_setting column: {err}")
+
+        try:
+            self.execute_query_(f"ALTER TABLE QanythingBot DROP COLUMN {DM_RESERVED_MODEL_COLUMN}", (), commit=True, raise_on_error=True)
+        except DMError as err:
+            if not self._is_object_missing_error(err):
+                debug_logger.error(f"Error dropping model column: {err}")
 
         debug_logger.info("All tables and indexes checked/created successfully.")
 
@@ -307,7 +328,7 @@ class KnowledgeBaseManager:
         return result[0][0] if result else None
 
     def check_user_exist_(self, user_id):
-        query = "SELECT user_id FROM User WHERE user_id = %s"
+        query = f"SELECT user_id FROM {DM_RESERVED_USER_TABLE} WHERE user_id = %s"
         result = self.execute_query_(query, (user_id,), fetch=True)
         debug_logger.info("check_user_exist {}".format(result))
         return result is not None and len(result) > 0
@@ -380,8 +401,11 @@ class KnowledgeBaseManager:
 
     # 对外接口不需要增加用户，新建知识库的时候增加用户就可以了
     def add_user_(self, user_id, user_name):
-        query = "INSERT IGNORE INTO User (user_id, user_name) VALUES (%s, %s)"
-        self.execute_query_(query, (user_id, user_name), commit=True)
+        query = f"INSERT INTO {DM_RESERVED_USER_TABLE} (user_id, user_name) VALUES (%s, %s)"
+        try:
+            self.execute_query_(query, (user_id, user_name), commit=True, raise_on_error=True)
+        except DMIntegrityError:
+            debug_logger.info(f"User already exists (this is okay): {user_id}")
         debug_logger.info(f"Add user: {user_id} {user_name}")
 
     def new_milvus_base(self, kb_id, user_id, kb_name, user_name=None):
@@ -400,7 +424,7 @@ class KnowledgeBaseManager:
         return self.execute_query_(query, (user_id,), fetch=True)
 
     def get_users(self):
-        query = "SELECT user_id FROM User"
+        query = f"SELECT user_id FROM {DM_RESERVED_USER_TABLE}"
         return self.execute_query_(query, (), fetch=True)
 
     def get_user_by_kb_id(self, kb_id):
@@ -567,8 +591,11 @@ class KnowledgeBaseManager:
     def add_document(self, doc_id, json_data):
         json_data = json.dumps(json_data, ensure_ascii=False)
         # insert_logger.info("add_document: {}".format(doc_id))
-        query = "INSERT IGNORE INTO Documents (doc_id, json_data) VALUES (%s, %s)"
-        self.execute_query_(query, (doc_id, json_data), commit=True, check=True)
+        query = "INSERT INTO Documents (doc_id, json_data) VALUES (%s, %s)"
+        try:
+            self.execute_query_(query, (doc_id, json_data), commit=True, check=True, raise_on_error=True)
+        except DMIntegrityError:
+            debug_logger.info(f"Document already exists (this is okay): {doc_id}")
 
     def update_document(self, doc_id, update_content):
         ori_doc_json = self.get_document_by_doc_id(doc_id)
@@ -680,7 +707,7 @@ class KnowledgeBaseManager:
         history = json.dumps(history, ensure_ascii=False)
         time_record = json.dumps(time_record, ensure_ascii=False)
         insert_query = (
-            "INSERT INTO QaLogs (qa_id, user_id, bot_id, kb_ids, query, model, product_source, time_record, "
+            f"INSERT INTO QaLogs (qa_id, user_id, bot_id, kb_ids, query, {DM_RESERVED_MODEL_COLUMN}, product_source, time_record, "
             "history, condense_question, prompt, result, retrieval_documents, source_documents) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
         self.execute_query_(insert_query, (qa_id, user_id, bot_id, kb_ids, query, model, product_source, time_record,
@@ -689,12 +716,13 @@ class KnowledgeBaseManager:
 
     def get_qalog_by_filter(self, need_info, user_id=None, query=None, bot_id=None, time_range=None, any_kb_id=None, qa_ids=None):
         # 判断哪些条件不是None，构建搜索query
-        need_info = ", ".join(need_info)
+        normalized_need_info = self._normalize_select_fields(need_info)
+        need_info_str = ", ".join(normalized_need_info)
         if qa_ids is not None:
-            mysql_query = f"SELECT {need_info} FROM QaLogs WHERE qa_id IN ({','.join(['%s'] * len(qa_ids))})"
+            mysql_query = f"SELECT {need_info_str} FROM QaLogs WHERE qa_id IN ({','.join(['%s'] * len(qa_ids))})"
             qa_infos = self.execute_query_(mysql_query, qa_ids, fetch=True)
         else:
-            mysql_query = f"SELECT {need_info} FROM QaLogs WHERE timestamp BETWEEN %s AND %s"
+            mysql_query = f"SELECT {need_info_str} FROM QaLogs WHERE timestamp BETWEEN %s AND %s"
             params = list(time_range)
             if user_id:
                 mysql_query += " AND user_id = %s"
@@ -710,8 +738,7 @@ class KnowledgeBaseManager:
                 params.append(query)
             debug_logger.info("get_qalog_by_filter: {}".format(params))
             qa_infos = self.execute_query_(mysql_query, params, fetch=True)
-        # 根据need_info构建一个dict
-        qa_infos = [dict(zip(need_info.split(", "), qa_info)) for qa_info in qa_infos]
+        qa_infos = [dict(zip([field.replace(DM_RESERVED_MODEL_COLUMN, 'model') for field in normalized_need_info], qa_info)) for qa_info in qa_infos]
         for qa_info in qa_infos:
             if 'timestamp' in qa_info:
                 qa_info['timestamp'] = qa_info['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
@@ -725,13 +752,13 @@ class KnowledgeBaseManager:
                 qa_info['source_documents'] = json.loads(qa_info['source_documents'])
             if 'history' in qa_info:
                 qa_info['history'] = json.loads(qa_info['history'])
-        if 'timestamp' in need_info:
+        if 'timestamp' in normalized_need_info:
             qa_infos = sorted(qa_infos, key=lambda x: x["timestamp"], reverse=True)
         return qa_infos
 
     def get_qalog_by_ids(self, ids, need_info):
         placeholders = ','.join(['%s'] * len(ids))
-        need_info = ", ".join(need_info)
+        need_info = ", ".join(self._normalize_select_fields(need_info))
         query = "SELECT {} FROM QaLogs WHERE qa_id IN ({})".format(need_info, placeholders)
         return self.execute_query_(query, ids, fetch=True)
 
@@ -763,7 +790,7 @@ class KnowledgeBaseManager:
             need_info.append("user_id")
         if "timestamp" not in need_info:
             need_info.append("timestamp")
-        need_info = ", ".join(need_info)
+        need_info = ", ".join(self._normalize_select_fields(need_info))
         query = f"SELECT {need_info} FROM QaLogs WHERE timestamp BETWEEN %s AND %s ORDER BY RAND() LIMIT %s"
         qa_infos = self.execute_query_(query, (time_range[0], time_range[1], limit), fetch=True, user_dict=True)
         for qa_info in qa_infos:
@@ -777,7 +804,7 @@ class KnowledgeBaseManager:
             need_info.append("user_id")
         if "kb_ids" not in need_info:
             need_info.append("kb_ids")
-        need_info = ", ".join(need_info)
+        need_info = ", ".join(self._normalize_select_fields(need_info))
         query = f"SELECT {need_info} FROM QaLogs WHERE qa_id = %s"
         qa_log = self.execute_query_(query, (qa_id,), fetch=True, user_dict=True)[0]
         qa_log['timestamp'] = qa_log['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
